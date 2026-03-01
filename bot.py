@@ -6,7 +6,7 @@ import aria2p
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait, MessageNotModified
 import py7zr
 import zipfile
@@ -48,17 +48,17 @@ MAX_UPLOAD_LABEL = "4GB" if OWNER_PREMIUM else "2GB"
 PORT = int(os.environ.get("PORT", "8000"))
 
 # Engine labels
-ENGINE_DL     = "ARIA2 v1.36.0"
-ENGINE_UL     = "Pyro v2.2.18"
+ENGINE_DL      = "ARIA2 v1.36.0"
+ENGINE_UL      = "Pyro v2.2.18"
 ENGINE_EXTRACT = "py7zr / zipfile"
 
 # Initialize clients with optimized settings for speed
 app   = Client(
-    "leech_bot", 
-    api_id=API_ID, 
-    api_hash=API_HASH, 
+    "leech_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=100,  # Increased workers for concurrent operations
+    workers=100,                  # Increased workers for concurrent operations
     max_concurrent_transmissions=5  # Parallel uploads
 )
 aria2 = aria2p.API(aria2p.Client(host=ARIA2_HOST, port=ARIA2_PORT, secret=ARIA2_SECRET))
@@ -67,6 +67,40 @@ active_downloads = {}
 
 # Thread pool for CPU-bound operations
 executor = ThreadPoolExecutor(max_workers=4)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Inline keyboard helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def refresh_keyboard(gid: str, phase: str = "dl") -> InlineKeyboardMarkup:
+    """
+    Returns an inline keyboard with a 🔄 Refresh button.
+
+    Callback data format:  refresh:<phase>:<gid>
+      phase = "dl"       → download progress
+      phase = "ul"       → upload progress
+      phase = "ext"      → extraction progress
+    """
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔄 Refresh",
+            callback_data=f"refresh:{phase}:{gid}"
+        )
+    ]])
+
+
+def stop_keyboard(gid: str, phase: str = "dl") -> InlineKeyboardMarkup:
+    """Refresh + Stop buttons side by side."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔄 Refresh",
+            callback_data=f"refresh:{phase}:{gid}"
+        ),
+        InlineKeyboardButton(
+            "🛑 Stop",
+            callback_data=f"stop:{gid}"
+        ),
+    ]])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,22 +118,24 @@ class DownloadTask:
         self.extract_dir = None
         self.filename    = ""
         self.file_size   = 0
-        self._last_edit_time = 0  # Rate limiting tracker
-        self._edit_count = 0      # Edit counter for flood protection
+        self._last_edit_time = 0   # Rate-limiting tracker
+        self._edit_count     = 0   # Edit counter for flood protection
+
+        # ── Snapshot of last rendered progress (used by Refresh callback) ──
+        self.last_status_text  = ""
+        self.current_phase     = "dl"   # "dl" | "ext" | "ul"
 
     def get_elapsed_time(self):
         elapsed = time.time() - self.start_time
         return str(timedelta(seconds=int(elapsed)))
-    
+
     def can_edit(self):
-        """Check if we can edit without hitting flood limits"""
+        """Check if we can edit without hitting flood limits."""
         now = time.time()
-        # Reset counter every 60 seconds
         if now - self._last_edit_time > 60:
-            self._edit_count = 0
+            self._edit_count     = 0
             self._last_edit_time = now
             return True
-        # Allow max 15 edits per minute (safe buffer below 20)
         if self._edit_count < 15:
             self._edit_count += 1
             return True
@@ -110,18 +146,10 @@ class DownloadTask:
 #  Filename cleaner  — strips "www.site.com - " prefixes
 # ─────────────────────────────────────────────────────────────────────────────
 def clean_filename(filename: str) -> str:
-    """
-    Remove leading site-name junk like:
-      www.1TamilMV.earth - The Housemaid...  →  The Housemaid...
-      [www.site.com] - Movie...              →  Movie...
-      www.site.com_Movie...                  →  Movie...
-    """
-    # Strip bracketed or plain www.* prefixes followed by a dash separator
     cleaned = re.sub(
         r'^\[?(?:www\.|WWW\.)[^\]\s]+\]?\s*[-–—_]\s*',
         '', filename
     )
-    # Also strip if no dash: "www.site.com.Movie.mkv" → "Movie.mkv"  (dot-separated)
     if cleaned == filename:
         cleaned = re.sub(
             r'^(?:www\.|WWW\.)[a-zA-Z0-9.-]+?\.',
@@ -137,7 +165,7 @@ def create_progress_bar(percentage: float) -> str:
     if percentage >= 100:
         return "[●●●●●●●●●●] 100%"
     filled = int(percentage / 10)
-    bar = "●" * filled + "○" * (10 - filled)
+    bar    = "●" * filled + "○" * (10 - filled)
     return f"[{bar}] {percentage:.1f}%"
 
 def format_speed(speed: float) -> str:
@@ -171,19 +199,18 @@ def get_system_stats() -> dict:
     ram         = psutil.virtual_memory()
     uptime      = time.time() - psutil.boot_time()
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    disk        = psutil.disk_usage(DOWNLOAD_DIR)
-    disk_free   = disk.free  / (1024 ** 3)
-    disk_free_pct = 100.0 - disk.percent          # free %
+    disk          = psutil.disk_usage(DOWNLOAD_DIR)
+    disk_free     = disk.free / (1024 ** 3)
+    disk_free_pct = 100.0 - disk.percent
     return {
-        'cpu':          cpu_percent,
-        'ram_percent':  ram.percent,
-        'uptime':       format_time(uptime),
-        'disk_free':    disk_free,
+        'cpu':           cpu_percent,
+        'ram_percent':   ram.percent,
+        'uptime':        format_time(uptime),
+        'disk_free':     disk_free,
         'disk_free_pct': disk_free_pct,
     }
 
 def bot_stats_block(stats: dict) -> str:
-    """© Bot Stats footer block — matches reference image format."""
     return (
         f"© **Bot Stats**\n"
         f"├ **CPU** → {stats['cpu']:.1f}% | **F** → {stats['disk_free']:.2f}GB [{stats['disk_free_pct']:.1f}%]\n"
@@ -214,30 +241,37 @@ def cleanup_files(task):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Safe message edit with flood protection
 # ─────────────────────────────────────────────────────────────────────────────
-async def safe_edit_message(message, text, task=None):
+async def safe_edit_message(message, text, task=None, reply_markup=None):
     """
-    Edit message with flood wait protection.
-    Implements exponential backoff and respects rate limits.
+    Edit message with flood-wait protection.
+    Attaches the supplied reply_markup (InlineKeyboardMarkup) if provided.
     """
     try:
-        # Check if we should skip this edit to avoid flood
         if task and not task.can_edit():
             return False
-            
-        await message.edit_text(text)
+        kwargs = {"text": text}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        await message.edit_text(**kwargs)
+        # Keep a snapshot for the Refresh callback
+        if task:
+            task.last_status_text = text
         return True
     except FloodWait as e:
-        # Wait the required time + small buffer
         wait_time = e.value + 2
         print(f"⏳ FloodWait: Sleeping for {wait_time}s")
         await asyncio.sleep(wait_time)
         try:
-            await message.edit_text(text)
+            kwargs = {"text": text}
+            if reply_markup is not None:
+                kwargs["reply_markup"] = reply_markup
+            await message.edit_text(**kwargs)
+            if task:
+                task.last_status_text = text
             return True
         except Exception:
             return False
     except MessageNotModified:
-        # Message content hasn't changed, ignore
         return True
     except Exception as e:
         print(f"⚠ Edit error: {e}")
@@ -245,14 +279,143 @@ async def safe_edit_message(message, text, task=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Download progress loop  ── OPTIMIZED with flood protection
+#  🔄 Refresh callback handler
+# ─────────────────────────────────────────────────────────────────────────────
+@app.on_callback_query(filters.regex(r"^refresh:"))
+async def refresh_callback(client, callback_query: CallbackQuery):
+    """
+    Handles the 🔄 Refresh button press.
+    Re-fetches live aria2 stats (for download) or uses the stored snapshot
+    (for upload / extraction) and edits the message in-place.
+    """
+    try:
+        _, phase, gid = callback_query.data.split(":", 2)
+    except ValueError:
+        await callback_query.answer("❌ Invalid callback data.", show_alert=True)
+        return
+
+    task = active_downloads.get(gid)
+    if not task:
+        await callback_query.answer("⚠️ Task finished or not found.", show_alert=True)
+        return
+
+    # ── Download phase: pull fresh data from aria2 ─────────────────────────
+    if phase == "dl":
+        try:
+            download   = aria2.get_download(gid)
+            progress   = download.progress or 0.0
+            speed      = download.download_speed or 0
+            total_size = download.total_length or 0
+            downloaded = download.completed_length or 0
+            _eta_td    = download.eta
+            eta        = _eta_td.total_seconds() if _eta_td and _eta_td.total_seconds() > 0 else 0
+            elapsed    = time.time() - task.start_time
+            raw_name   = download.name if download.name else "Connecting…"
+            filename   = clean_filename(raw_name)
+
+            try:
+                seeders  = getattr(download, 'num_seeders', None)
+                leechers = getattr(download, 'connections', None)
+                if seeders is not None and seeders > 0:
+                    peer_line = f"├ **Seeders** → {seeders} | **Leechers** → {leechers or 0}\n"
+                else:
+                    conns     = download.connections or 0
+                    peer_line = f"├ **Connections** → {conns}\n"
+            except Exception:
+                peer_line = ""
+
+            size_text = (
+                f"{format_size(downloaded)} of {format_size(total_size)}"
+                if total_size > 0 else "Fetching file info…"
+            )
+            total_est = elapsed + eta
+            time_line = f"{format_time(elapsed)} of {format_time(total_est)} ( {format_time(eta)} )"
+            stats     = get_system_stats()
+            user_label = f"#ID{task.user_id}"
+
+            status_text = (
+                f"**{filename}**\n\n"
+                f"**Task By** {user_label} [Link]\n"
+                f"├ {create_progress_bar(progress)}\n"
+                f"├ **Processed** → {size_text}\n"
+                f"├ **Status** → Download\n"
+                f"├ **Speed** → {format_speed(speed)}\n"
+                f"├ **Time** → {time_line}\n"
+                f"{peer_line}"
+                f"├ **Engine** → {ENGINE_DL}\n"
+                f"├ **In Mode** → #ARIA2\n"
+                f"├ **Out Mode** → #Leech\n"
+                f"└ **Stop** → /stop_{gid[:8]}\n\n"
+                f"{bot_stats_block(stats)}"
+            )
+            task.last_status_text = status_text
+
+            await callback_query.edit_message_text(
+                status_text,
+                reply_markup=stop_keyboard(gid, "dl")
+            )
+            await callback_query.answer("✅ Refreshed!")
+        except Exception as e:
+            await callback_query.answer(f"❌ Error: {e}", show_alert=True)
+
+    # ── Upload / Extraction phase: use stored snapshot ──────────────────────
+    elif phase in ("ul", "ext"):
+        if task.last_status_text:
+            try:
+                await callback_query.edit_message_text(
+                    task.last_status_text,
+                    reply_markup=stop_keyboard(gid, phase)
+                )
+                await callback_query.answer("✅ Refreshed!")
+            except MessageNotModified:
+                await callback_query.answer("ℹ️ Already up to date.")
+            except Exception as e:
+                await callback_query.answer(f"❌ Error: {e}", show_alert=True)
+        else:
+            await callback_query.answer("⚠️ No data yet.", show_alert=True)
+    else:
+        await callback_query.answer("❌ Unknown phase.", show_alert=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  🛑 Stop via inline button callback
+# ─────────────────────────────────────────────────────────────────────────────
+@app.on_callback_query(filters.regex(r"^stop:"))
+async def stop_callback(client, callback_query: CallbackQuery):
+    """Handles the 🛑 Stop button on the inline keyboard."""
+    try:
+        _, gid = callback_query.data.split(":", 1)
+    except ValueError:
+        await callback_query.answer("❌ Invalid callback data.", show_alert=True)
+        return
+
+    task = active_downloads.get(gid)
+    if not task:
+        await callback_query.answer("⚠️ Task already finished.", show_alert=True)
+        return
+
+    task.cancelled = True
+    try:
+        download = aria2.get_download(gid)
+        aria2.remove([download], force=True, files=True)
+        cleanup_files(task)
+    except Exception as e:
+        print(f"Stop callback error: {e}")
+
+    active_downloads.pop(gid, None)
+    await callback_query.answer("🛑 Task cancelled!")
+    await callback_query.edit_message_text("❌ **Download cancelled**\n✅ **Files cleaned up!**")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Download progress loop
 # ─────────────────────────────────────────────────────────────────────────────
 async def update_progress(task: DownloadTask, message):
     try:
         await asyncio.sleep(2)
-        update_count = 0
-        last_progress = -1  # Track last progress to avoid redundant edits
-        
+        update_count  = 0
+        last_progress = -1
+
         while not task.cancelled:
             try:
                 download   = aria2.get_download(task.gid)
@@ -271,20 +434,18 @@ async def update_progress(task: DownloadTask, message):
                 task.filename  = filename
                 task.file_size = total_size
 
-                # Skip update if progress hasn't changed significantly (0.5% threshold)
                 if abs(progress - last_progress) < 0.5 and progress < 100:
                     await asyncio.sleep(2)
                     continue
                 last_progress = progress
 
-                # Seeders / Leechers (torrent) or Connections (HTTP)
                 try:
-                    seeders   = getattr(download, 'num_seeders', None)
-                    leechers  = getattr(download, 'connections', None)
+                    seeders  = getattr(download, 'num_seeders', None)
+                    leechers = getattr(download, 'connections', None)
                     if seeders is not None and seeders > 0:
                         peer_line = f"├ **Seeders** → {seeders} | **Leechers** → {leechers or 0}\n"
                     else:
-                        conns = download.connections or 0
+                        conns     = download.connections or 0
                         peer_line = f"├ **Connections** → {conns}\n"
                 except Exception:
                     peer_line = ""
@@ -293,12 +454,9 @@ async def update_progress(task: DownloadTask, message):
                     f"{format_size(downloaded)} of {format_size(total_size)}"
                     if total_size > 0 else "Fetching file info…"
                 )
-
-                # Time line: "elapsed of total_est ( eta )"
                 total_est = elapsed + eta
                 time_line = f"{format_time(elapsed)} of {format_time(total_est)} ( {format_time(eta)} )"
-
-                stats      = get_system_stats()
+                stats     = get_system_stats()
                 user_label = get_user_label(message, task)
 
                 status_text = (
@@ -317,22 +475,25 @@ async def update_progress(task: DownloadTask, message):
                     f"{bot_stats_block(stats)}"
                 )
 
-                # Only edit every 3rd iteration OR if significant change, with flood protection
                 if update_count % 3 == 0 or progress >= 100:
-                    await safe_edit_message(message, status_text, task)
+                    task.current_phase = "dl"
+                    await safe_edit_message(
+                        message, status_text, task,
+                        reply_markup=stop_keyboard(task.gid, "dl")
+                    )
 
             except Exception as iter_err:
                 print(f"Progress iteration error: {iter_err}")
 
             update_count += 1
-            await asyncio.sleep(3)  # Increased sleep to reduce API calls
+            await asyncio.sleep(3)
 
     except Exception as e:
         print(f"Progress update error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Extraction with live progress UI  ── OPTIMIZED
+#  Extraction with live progress UI
 # ─────────────────────────────────────────────────────────────────────────────
 async def extract_archive(file_path, extract_to, status_msg=None, task=None):
     try:
@@ -342,13 +503,14 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
         start_time = time.time()
         last_update = 0
 
+        if task:
+            task.current_phase = "ext"
+
         async def _render(extracted_bytes, total_bytes, current_file, file_index, total_files):
             nonlocal last_update
             now = time.time()
-            # Throttle updates to every 3 seconds minimum
             if now - last_update < 3 and extracted_bytes < total_bytes:
                 return
-            
             last_update = now
             pct       = min((extracted_bytes / total_bytes) * 100, 100) if total_bytes > 0 else 0
             elapsed   = time.time() - start_time
@@ -373,55 +535,55 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
                 f"└ **Archive Size** → {format_size(total_size)}\n\n"
                 f"{bot_stats_block(stats)}"
             )
-            await safe_edit_message(status_msg, text, task)
+            gid = task.gid if task else "unknown"
+            await safe_edit_message(
+                status_msg, text, task,
+                reply_markup=refresh_keyboard(gid, "ext")
+            )
 
         # ── ZIP ───────────────────────────────────────────────────────────────
         if file_path.endswith('.zip'):
-            # Run extraction in thread pool to avoid blocking
             loop = asyncio.get_event_loop()
-            
+
             def extract_zip():
                 with zipfile.ZipFile(file_path, 'r') as zf:
-                    members = zf.infolist()
-                    total_files = len(members)
+                    members            = zf.infolist()
+                    total_files        = len(members)
                     uncompressed_total = sum(m.file_size for m in members)
-                    extracted_bytes = 0
-                    
+                    extracted_bytes    = 0
                     for idx, member in enumerate(members, start=1):
                         zf.extract(member, extract_to)
                         extracted_bytes += member.file_size
-                        
-                        # Update progress every 5 files or on last file
                         if idx % 5 == 0 or idx == total_files:
                             asyncio.run_coroutine_threadsafe(
                                 _render(extracted_bytes, uncompressed_total, member.filename, idx, total_files),
                                 loop
                             )
                 return True
-            
+
             return await loop.run_in_executor(executor, extract_zip)
 
         # ── 7z ───────────────────────────────────────────────────────────────
         elif file_path.endswith('.7z'):
             with py7zr.SevenZipFile(file_path, mode='r') as archive:
-                members = archive.list()
+                members     = archive.list()
                 total_files = len(members)
-                total_unc = sum(getattr(m, 'uncompressed', 0) or 0 for m in members)
+                total_unc   = sum(getattr(m, 'uncompressed', 0) or 0 for m in members)
                 extracted_bytes = 0
                 update_tick = 0
 
                 class _CB(py7zr.callbacks.ExtractCallback):
-                    def __init__(s): 
+                    def __init__(s):
                         s.file_index = 0
                         s.loop = asyncio.get_event_loop()
                     def report_start_preparation(s): pass
-                    def report_start(s, p, b): 
+                    def report_start(s, p, b):
                         s.file_index += 1
                     def report_update(s, b): pass
                     def report_end(s, p, wrote_bytes):
                         nonlocal extracted_bytes, update_tick
                         extracted_bytes += wrote_bytes
-                        update_tick += 1
+                        update_tick     += 1
                         if update_tick % 5 == 0:
                             asyncio.run_coroutine_threadsafe(
                                 _render(extracted_bytes, total_unc or total_size, filename, s.file_index, total_files),
@@ -445,30 +607,26 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
         elif file_path.endswith(('.tar.gz', '.tgz', '.tar')):
             import tarfile
             loop = asyncio.get_event_loop()
-            
+
             def extract_tar():
                 with tarfile.open(file_path, 'r:*') as tf:
-                    members = tf.getmembers()
+                    members     = tf.getmembers()
                     total_files = len(members)
-                    total_unc = sum(m.size for m in members)
+                    total_unc   = sum(m.size for m in members)
                     extracted_bytes = 0
-                    
                     for idx, member in enumerate(members, start=1):
                         tf.extract(member, extract_to)
                         extracted_bytes += member.size
-                        
                         if idx % 5 == 0 or idx == total_files:
                             asyncio.run_coroutine_threadsafe(
                                 _render(extracted_bytes, total_unc, member.name, idx, total_files),
                                 loop
                             )
                 return True
-            
+
             return await loop.run_in_executor(executor, extract_tar)
         else:
             return False
-
-        return True
 
     except Exception as e:
         print(f"Extraction error: {e}")
@@ -476,20 +634,23 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Upload with live progress UI  ── OPTIMIZED for speed with flood protection
+#  Upload with live progress UI
 # ─────────────────────────────────────────────────────────────────────────────
 async def upload_to_telegram(file_path, message, caption="", status_msg=None, task=None):
 
+    if task:
+        task.current_phase = "ul"
+
     async def _render_upload(raw_filename, uploaded, total, file_index, total_files, speed, elapsed, eta, gid_short=""):
-        filename = clean_filename(raw_filename)
-        pct      = min((uploaded / total) * 100, 100) if total > 0 else 0
-        stats    = get_system_stats()
+        filename   = clean_filename(raw_filename)
+        pct        = min((uploaded / total) * 100, 100) if total > 0 else 0
+        stats      = get_system_stats()
         user_label = get_user_label(message, task) if task else "Unknown"
 
-        file_line  = f"├ **Files** → {file_index}/{total_files}\n" if total_files > 1 else ""
-        time_line  = f"of {format_time(elapsed + eta)} ( {format_time(elapsed)} )"
-
-        stop_id    = gid_short or (task.gid[:8] if task else "unknown")
+        file_line = f"├ **Files** → {file_index}/{total_files}\n" if total_files > 1 else ""
+        time_line = f"of {format_time(elapsed + eta)} ( {format_time(elapsed)} )"
+        stop_id   = gid_short or (task.gid[:8] if task else "unknown")
+        gid_full  = task.gid if task else gid_short
 
         text = (
             f"**{filename}**\n\n"
@@ -506,10 +667,14 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
             f"└ **Stop** → /stop_{stop_id}\n\n"
             f"{bot_stats_block(stats)}"
         )
-        await safe_edit_message(status_msg, text, task)
+        await safe_edit_message(
+            status_msg, text, task,
+            reply_markup=stop_keyboard(gid_full, "ul")
+        )
 
     try:
         gid_short = task.gid[:8] if task else "unknown"
+        gid_full  = task.gid     if task else gid_short
 
         # ── Single file ────────────────────────────────────────────────────────
         if os.path.isfile(file_path):
@@ -527,29 +692,23 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
             async def _progress(current, total):
                 now     = time.time()
                 elapsed = now - start_time
-                
-                # Throttle progress updates to every 5 seconds to avoid flood
                 if now - last_render_time[0] < 5:
                     return
-                    
-                dt      = now - last_update_time[0]
+                dt    = now - last_update_time[0]
                 speed = (current - last_uploaded[0]) / dt if dt > 0 else 0
                 eta   = (total - current) / speed if speed > 0 else 0
                 last_update_time[0] = now
                 last_uploaded[0]    = current
                 last_render_time[0] = now
-                
                 await _render_upload(raw_name, current, total, 1, 1, speed, elapsed, eta, gid_short)
 
             await _render_upload(raw_name, 0, file_size, 1, 1, 0, 0, 0, gid_short)
             clean_cap = clean_filename(raw_name)
-            
-            # Upload with optimized chunk size for speed
+
             await message.reply_document(
                 document=file_path,
                 caption=caption or clean_cap,
                 progress=_progress,
-                # Disable notification to speed up
                 disable_notification=True
             )
             elapsed = time.time() - start_time
@@ -576,7 +735,6 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
 
             async def _render_multi():
                 now = time.time()
-                # Throttle to every 10 seconds for batch updates
                 if now - last_render[0] < 10:
                     return
                 last_render[0]  = now
@@ -597,7 +755,6 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
                     f"├ **In Mode** → #Aria2\n",
                     f"├ **Out Mode** → #Leech\n",
                 ]
-                # Show max 3 files to keep message short
                 for i, fp in list(enumerate(files, start=1))[:3]:
                     fname         = clean_filename(os.path.basename(fp))
                     uploaded, tot = file_progress[i]
@@ -612,7 +769,10 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
                     f"└ **Stop** → /stop_{gid_short}\n\n"
                     f"{bot_stats_block(stats)}"
                 )
-                await safe_edit_message(status_msg, "".join(lines), task)
+                await safe_edit_message(
+                    status_msg, "".join(lines), task,
+                    reply_markup=stop_keyboard(gid_full, "ul")
+                )
 
             async def _upload_one(file_index, fpath):
                 file_size = os.path.getsize(fpath)
@@ -621,7 +781,6 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
 
                 async def _progress(current, total):
                     file_progress[file_index] = (current, total)
-                    # Only render every 10 seconds
                     if time.time() - last_render[0] >= 10:
                         await _render_multi()
 
@@ -635,16 +794,15 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
                 file_progress[file_index] = (file_size, file_size)
 
             await _render_multi()
-            
-            # Upload files with limited concurrency to avoid overwhelming Telegram
-            semaphore = asyncio.Semaphore(3)  # Max 3 concurrent uploads
-            
+
+            semaphore = asyncio.Semaphore(3)
+
             async def _upload_with_limit(index, fpath):
                 async with semaphore:
                     return await _upload_one(index, fpath)
-            
+
             await asyncio.gather(*[_upload_with_limit(i, fp) for i, fp in enumerate(files, start=1)])
-            
+
             last_render[0] = 0
             await _render_multi()
             return True
@@ -669,14 +827,16 @@ async def start_command(client, message: Message):
         f"✓ Direct links (HTTP/HTTPS/FTP)\n"
         f"✓ Auto extraction (.zip, .7z, .tar.gz)\n"
         f"✓ Live progress — Download / Extract / Upload\n"
+        f"✓ 🔄 **Refresh button** on all progress messages\n"
+        f"✓ 🛑 **Stop button** on all progress messages\n"
         f"✓ Concurrent multi-file uploads\n"
         f"✓ CPU / RAM / Disk monitoring\n"
         f"✓ Auto cleanup after upload\n"
         f"✓ Site-name prefix auto-removed from filenames\n"
         f"✓ Max upload: **{MAX_UPLOAD_LABEL}** ({'Premium ⭐' if OWNER_PREMIUM else 'Standard'})\n\n"
         "**📖 Examples:**\n"
-        "`/leech https://example.com/file.zip `\n"
-        "`/l https://example.com/archive.7z  -e`\n"
+        "`/leech https://example.com/file.zip`\n"
+        "`/l https://example.com/archive.7z -e`\n"
     )
     await message.reply_text(help_text)
 
@@ -710,17 +870,29 @@ async def leech_command(client, message: Message):
                 download.update()
 
             if task.cancelled:
-                await safe_edit_message(status_msg, "❌ **Download cancelled**\n🧹 **Cleaning up...**", task)
+                await safe_edit_message(
+                    status_msg,
+                    "❌ **Download cancelled**\n🧹 **Cleaning up...**",
+                    task
+                )
                 try:
                     aria2.remove([download], force=True, files=True)
                 except Exception:
                     pass
                 cleanup_files(task)
                 active_downloads.pop(gid, None)
-                await safe_edit_message(status_msg, "❌ **Download cancelled**\n✅ **Files cleaned up!**", task)
+                await safe_edit_message(
+                    status_msg,
+                    "❌ **Download cancelled**\n✅ **Files cleaned up!**",
+                    task
+                )
                 return
 
-            await safe_edit_message(status_msg, "✅ **Download completed!**\n📤 **Starting upload...**", task)
+            await safe_edit_message(
+                status_msg,
+                "✅ **Download completed!**\n📤 **Starting upload...**",
+                task
+            )
             download.update()
             file_path      = os.path.join(DOWNLOAD_DIR, download.name)
             task.file_path = file_path
@@ -731,25 +903,41 @@ async def leech_command(client, message: Message):
                 task.extract_dir = extract_dir
                 await safe_edit_message(status_msg, "📦 **Starting extraction...**", task)
                 if await extract_archive(file_path, extract_dir, status_msg=status_msg, task=task):
-                    await safe_edit_message(status_msg, "✅ **Extraction done!**\n📤 **Uploading to Telegram...**", task)
+                    await safe_edit_message(
+                        status_msg,
+                        "✅ **Extraction done!**\n📤 **Uploading to Telegram...**",
+                        task
+                    )
                     await upload_to_telegram(
                         extract_dir, message,
                         caption="📁 Extracted files",
                         status_msg=status_msg, task=task
                     )
                 else:
-                    await safe_edit_message(status_msg, "❌ **Extraction failed!** Uploading original...", task)
+                    await safe_edit_message(
+                        status_msg,
+                        "❌ **Extraction failed!** Uploading original...",
+                        task
+                    )
                     await upload_to_telegram(file_path, message, status_msg=status_msg, task=task)
             else:
                 await upload_to_telegram(file_path, message, status_msg=status_msg, task=task)
 
-            await safe_edit_message(status_msg, "✅ **Upload completed!**\n🧹 **Cleaning up files...**", task)
+            await safe_edit_message(
+                status_msg,
+                "✅ **Upload completed!**\n🧹 **Cleaning up files...**",
+                task
+            )
             cleanup_files(task)
             await safe_edit_message(status_msg, "✅ **Task completed successfully!**", task)
             active_downloads.pop(gid, None)
 
         except Exception as e:
-            await safe_edit_message(status_msg, f"❌ **Error:** `{str(e)}`\n🧹 **Cleaning up...**", task)
+            await safe_edit_message(
+                status_msg,
+                f"❌ **Error:** `{str(e)}`\n🧹 **Cleaning up...**",
+                task
+            )
             if task:
                 cleanup_files(task)
             active_downloads.pop(gid, None)
