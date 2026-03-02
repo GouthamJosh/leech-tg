@@ -25,6 +25,11 @@ try:
 except ImportError:
     print("⚠️ uvloop not installed. Install with: pip install uvloop")
 
+try:
+    import tgcrypto
+    print("✅ TgCrypto installed - UPLOAD SPEED BOOST ACTIVE")
+except ImportError:
+    print("⚠️ TgCrypto not installed! Uploads will be VERY SLOW. Install with: pip install tgcrypto")
 # ─────────────────────────────────────────────────────────────────────────────
 #  Configuration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,22 +52,47 @@ ENGINE_DL      = "ARIA2 v1.36.0"
 ENGINE_UL      = "Pyro v2.2.18"
 ENGINE_EXTRACT = "py7zr / zipfile"
 
+# Expanded Public Trackers for maximum peer discovery
+TRACKERS = (
+    "udp://tracker.opentrackr.org:1337/announce,"
+    "udp://tracker.openbittorrent.com:6969/announce,"
+    "http://tracker.openbittorrent.com:80/announce,"
+    "udp://tracker.torrent.eu.org:451/announce,"
+    "udp://exodus.desync.com:6969/announce,"
+    "udp://tracker.cyberia.is:6969/announce,"
+    "udp://open.demonii.com:1337/announce"
+)
+
+# Supercharged Aria2 Torrent/Magnet Options
+BT_OPTIONS = {
+    "dir": DOWNLOAD_DIR,
+    "seed-time": "0",
+    "disk-cache": "32M",                   # Increased to smooth out fast downloads
+    "file-allocation": "none",             # CRITICAL: Skips the slow disk pre-allocation freeze
+    "bt-max-peers": "150",                 # Connect to up to 150 seeders at once (default is 55)
+    "bt-request-peer-speed-limit": "10M",  # Forces aria2 to demand more data from fast peers
+    "enable-dht": "true",
+    "enable-peer-exchange": "true",
+    "bt-tracker": TRACKERS
+}
+
 app = Client(
     "leech_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=100,
-    max_concurrent_transmissions=5
+    workers=200,
+    max_concurrent_transmissions=10
 )
 aria2 = aria2p.API(aria2p.Client(host=ARIA2_HOST, port=ARIA2_PORT, secret=ARIA2_SECRET))
 
+# Store active downloads and user settings
 active_downloads = {}
+user_settings = {}  # Format: {user_id: {"as_video": True}}
 executor = ThreadPoolExecutor(max_workers=4)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  Task class  ── stores LIVE state for every phase so Refresh is always fresh
+#  Task class  ── stores LIVE state for every phase
 # ─────────────────────────────────────────────────────────────────────────────
 class DownloadTask:
     def __init__(self, gid, user_id, message_id, extract=False):
@@ -79,17 +109,14 @@ class DownloadTask:
         self._last_edit_time = 0
         self._edit_count     = 0
 
-        # current phase tracker
-        self.current_phase = "dl"   # "dl" | "ext" | "ul"
+        self.current_phase = "dl"
 
-        # live download snapshot (updated every progress tick)
         self.dl = {
             "filename": "", "progress": 0.0, "speed": 0,
             "downloaded": 0, "total": 0, "elapsed": 0,
             "eta": 0, "peer_line": "",
         }
 
-        # live extraction snapshot
         self.ext = {
             "filename": "", "pct": 0.0, "speed": 0,
             "extracted": 0, "total": 0, "elapsed": 0,
@@ -97,13 +124,12 @@ class DownloadTask:
             "total_files": 0, "archive_size": 0,
         }
 
-        # live upload snapshot
         self.ul = {
             "filename": "", "uploaded": 0, "total": 0,
             "speed": 0, "elapsed": 0, "eta": 0,
             "file_index": 1, "total_files": 1,
-            "file_map": {},     # {index: (uploaded, total)}
-            "file_list": [],    # [(index, path), ...]
+            "file_map": {},     
+            "file_list": [],    
         }
 
     def can_edit(self):
@@ -119,18 +145,19 @@ class DownloadTask:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Filename cleaner
+#  Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def clean_filename(filename: str) -> str:
-    cleaned = re.sub(r'^\[?(?:www\.|WWW\.)[^\]\s]+\]?\s*[-–—_]\s*', '', filename)
-    if cleaned == filename:
-        cleaned = re.sub(r'^(?:www\.|WWW\.)[a-zA-Z0-9.-]+?\.', '', filename)
+    """Aggressively removes website URLs, tags, and Telegram handles from the start of the file."""
+    # 1. Remove [AnyText] or (AnyText) at the start
+    cleaned = re.sub(r'^\[.*?\]\s*|^\(.*?\)\s*', '', filename)
+    # 2. Remove @ChannelName at the start
+    cleaned = re.sub(r'^@\w+\s*', '', cleaned)
+    # 3. Remove www.site.com or site.mkv prefixes (with optional hyphens/underscores)
+    cleaned = re.sub(r'^(?:(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\s*[-–_]*\s*)', '', cleaned, flags=re.IGNORECASE)
+    
     return cleaned.strip() if cleaned.strip() else filename
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Formatting helpers
-# ─────────────────────────────────────────────────────────────────────────────
 def create_progress_bar(percentage: float) -> str:
     if percentage >= 100:
         return "[●●●●●●●●●●] 100%"
@@ -139,16 +166,16 @@ def create_progress_bar(percentage: float) -> str:
 
 def format_speed(speed: float) -> str:
     if speed >= 1024 * 1024:
-        return f"{speed / (1024 * 1024):.2f}MB/s"
+        return f"{speed / (1024 * 1024):.2f} MB/s"
     elif speed >= 1024:
-        return f"{speed / 1024:.2f}KB/s"
+        return f"{speed / 1024:.2f} KB/s"
     return "0 B/s"
 
 def format_size(size_bytes: int) -> str:
     gb = size_bytes / (1024 ** 3)
     if gb >= 1:
-        return f"{gb:.2f}GB"
-    return f"{size_bytes / (1024 ** 2):.2f}MB"
+        return f"{gb:.2f} GB"
+    return f"{size_bytes / (1024 ** 2):.2f} MB"
 
 def format_time(seconds: float) -> str:
     if seconds <= 0:
@@ -157,9 +184,9 @@ def format_time(seconds: float) -> str:
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     if h > 0:
-        return f"{h}h{m}m{s}s"
+        return f"{h}h {m}m {s}s"
     elif m > 0:
-        return f"{m}m{s}s"
+        return f"{m}m {s}s"
     return f"{s}s"
 
 def get_system_stats() -> dict:
@@ -202,23 +229,22 @@ def cleanup_files(task):
     except Exception as e:
         print(f"⚠ Cleanup error: {e}")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  Status text builders  ── called by both auto-update AND Refresh button
+#  Status Text Builders
 # ─────────────────────────────────────────────────────────────────────────────
 def build_dl_text(task: DownloadTask, user_label: str) -> str:
     d         = task.dl
     gid_short = task.gid[:8]
     stats     = get_system_stats()
-    size_text = (
-        f"{format_size(d['downloaded'])} of {format_size(d['total'])}"
-        if d['total'] > 0 else "Fetching file info…"
-    )
-    total_est = d['elapsed'] + d['eta']
-    time_line = (
-        f"{format_time(d['elapsed'])} of {format_time(total_est)} "
-        f"( {format_time(d['eta'])} )"
-    )
+    
+    # If size is 0 and it's a torrent/magnet, it's fetching metadata
+    if d['total'] == 0:
+        size_text = "Fetching Metadata/Peers..."
+    else:
+        size_text = f"{format_size(d['downloaded'])} of {format_size(d['total'])}"
+        
+    time_line = f"Elapsed: {format_time(d['elapsed'])} | ETA: {format_time(d['eta'])}"
+    
     return (
         f"**{d['filename'] or 'Connecting…'}**\n\n"
         f"**Task By** {user_label} [Link]\n"
@@ -235,10 +261,11 @@ def build_dl_text(task: DownloadTask, user_label: str) -> str:
         f"{bot_stats_block(stats)}"
     )
 
-
 def build_ext_text(task: DownloadTask, user_label: str) -> str:
     e     = task.ext
     stats = get_system_stats()
+    time_line = f"Elapsed: {format_time(e['elapsed'])} | ETA: {format_time(e['remaining'])}"
+    
     return (
         f"**{e['filename'] or 'Extracting…'}**\n\n"
         f"**Task By** {user_label} [Link]\n"
@@ -246,7 +273,7 @@ def build_ext_text(task: DownloadTask, user_label: str) -> str:
         f"├ **Processed** → {format_size(e['extracted'])} of {format_size(e['total'])}\n"
         f"├ **Status** → Extracting\n"
         f"├ **Speed** → {format_speed(e['speed'])}\n"
-        f"├ **Time** → {format_time(e['elapsed'])} ( {format_time(e['remaining'])} )\n"
+        f"├ **Time** → {time_line}\n"
         f"├ **File** → `{e['cur_file']}` [{e['file_index']}/{e['total_files']}]\n"
         f"├ **Engine** → {ENGINE_EXTRACT}\n"
         f"├ **In Mode** → #Extract\n"
@@ -255,16 +282,14 @@ def build_ext_text(task: DownloadTask, user_label: str) -> str:
         f"{bot_stats_block(stats)}"
     )
 
-
 def build_ul_text(task: DownloadTask, user_label: str) -> str:
     u         = task.ul
     stats     = get_system_stats()
     gid_short = task.gid[:8]
 
-    # single file
     if u['total_files'] <= 1:
         pct       = min((u['uploaded'] / u['total']) * 100, 100) if u['total'] > 0 else 0
-        time_line = f"of {format_time(u['elapsed'] + u['eta'])} ( {format_time(u['elapsed'])} )"
+        time_line = f"Elapsed: {format_time(u['elapsed'])} | ETA: {format_time(u['eta'])}"
         return (
             f"**{clean_filename(u['filename'])}**\n\n"
             f"**Task By** {user_label} [Link]\n"
@@ -280,20 +305,24 @@ def build_ul_text(task: DownloadTask, user_label: str) -> str:
             f"{bot_stats_block(stats)}"
         )
 
-    # multi-file
     file_map    = u['file_map']
     file_list   = u['file_list']
     total_files = u['total_files']
     total_up    = sum(v[0] for v in file_map.values())
     total_tot   = sum(v[1] for v in file_map.values())
     overall_pct = min((total_up / total_tot) * 100, 100) if total_tot > 0 else 0
+    
+    overall_speed = total_up / u['elapsed'] if u['elapsed'] > 0 else 0
+    overall_eta   = (total_tot - total_up) / overall_speed if overall_speed > 0 else 0
+    time_line     = f"Elapsed: {format_time(u['elapsed'])} | ETA: {format_time(overall_eta)}"
 
     lines = [
         f"**Task By** {user_label} [Link]\n",
         f"├ **Overall** {create_progress_bar(overall_pct)}\n",
         f"├ **Processed** → {format_size(total_up)} of {format_size(total_tot)}\n",
         f"├ **Status** → Upload ({total_files} files)\n",
-        f"├ **Time** → {format_time(u['elapsed'])}\n",
+        f"├ **Speed** → {format_speed(overall_speed)}\n",
+        f"├ **Time** → {time_line}\n",
         f"├ **Engine** → {ENGINE_UL}\n",
         f"├ **In Mode** → #Aria2\n",
         f"├ **Out Mode** → #Leech\n",
@@ -310,25 +339,19 @@ def build_ul_text(task: DownloadTask, user_label: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Inline keyboard helpers
+#  Keyboards & Message Editors
 # ─────────────────────────────────────────────────────────────────────────────
 def stop_keyboard(gid: str, phase: str) -> InlineKeyboardMarkup:
-    """Refresh + Stop buttons."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{phase}:{gid}"),
         InlineKeyboardButton("🛑 Stop",    callback_data=f"stop:{gid}"),
     ]])
 
 def refresh_only_keyboard(gid: str, phase: str) -> InlineKeyboardMarkup:
-    """Only a Refresh button (extraction — no stop mid-extract)."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{phase}:{gid}"),
     ]])
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Safe message edit
-# ─────────────────────────────────────────────────────────────────────────────
 async def safe_edit_message(message, text, task=None, reply_markup=None):
     try:
         if task and not task.can_edit():
@@ -356,7 +379,7 @@ async def safe_edit_message(message, text, task=None, reply_markup=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  🔄 Refresh callback  ── rebuilds text from LIVE task state every single tap
+#  Callbacks (Refresh / Stop)
 # ─────────────────────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^refresh:"))
 async def refresh_callback(client, callback_query: CallbackQuery):
@@ -375,9 +398,8 @@ async def refresh_callback(client, callback_query: CallbackQuery):
 
     try:
         if phase == "dl":
-            # Pull FRESH data directly from aria2 right now
             try:
-                download = aria2.get_download(gid)
+                download = aria2.get_download(task.gid) # Ensure we use the latest GID
                 task.dl["progress"]   = download.progress or 0.0
                 task.dl["speed"]      = download.download_speed or 0
                 task.dl["total"]      = download.total_length or 0
@@ -390,9 +412,7 @@ async def refresh_callback(client, callback_query: CallbackQuery):
                 try:
                     seeders = getattr(download, 'num_seeders', None)
                     if seeders and seeders > 0:
-                        task.dl["peer_line"] = (
-                            f"├ **Seeders** → {seeders} | **Leechers** → {download.connections or 0}\n"
-                        )
+                        task.dl["peer_line"] = f"├ **Seeders** → {seeders} | **Leechers** → {download.connections or 0}\n"
                     else:
                         task.dl["peer_line"] = f"├ **Connections** → {download.connections or 0}\n"
                 except Exception:
@@ -402,35 +422,31 @@ async def refresh_callback(client, callback_query: CallbackQuery):
                 return
 
             text = build_dl_text(task, user_label)
-            kb   = stop_keyboard(gid, "dl")
+            kb   = stop_keyboard(task.gid, "dl")
 
         elif phase == "ext":
-            # Recalculate elapsed/remaining from current wall-clock time
             now = time.time()
             task.ext["elapsed"] = now - task.start_time
             if task.ext["speed"] > 0 and task.ext["total"] > 0:
-                task.ext["remaining"] = max(
-                    (task.ext["total"] - task.ext["extracted"]) / task.ext["speed"], 0
-                )
+                task.ext["remaining"] = max((task.ext["total"] - task.ext["extracted"]) / task.ext["speed"], 0)
             text = build_ext_text(task, user_label)
-            kb   = refresh_only_keyboard(gid, "ext")
+            kb   = refresh_only_keyboard(task.gid, "ext")
 
         elif phase == "ul":
-            # Recalculate elapsed and ETA from current time
             now = time.time()
             task.ul["elapsed"] = now - task.start_time
             if task.ul["total_files"] <= 1 and task.ul["speed"] > 0:
                 remaining = task.ul["total"] - task.ul["uploaded"]
                 task.ul["eta"] = max(remaining / task.ul["speed"], 0) if remaining > 0 else 0
             text = build_ul_text(task, user_label)
-            kb   = stop_keyboard(gid, "ul")
+            kb   = stop_keyboard(task.gid, "ul")
 
         else:
             await callback_query.answer("❌ Unknown phase.", show_alert=True)
             return
 
         await callback_query.edit_message_text(text, reply_markup=kb)
-        await callback_query.answer("✅ Refreshed!")
+        await callback_query.answer("")
 
     except MessageNotModified:
         await callback_query.answer("ℹ️ Already up to date.")
@@ -438,9 +454,6 @@ async def refresh_callback(client, callback_query: CallbackQuery):
         await callback_query.answer(f"❌ Error: {e}", show_alert=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  🛑 Stop via inline button
-# ─────────────────────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^stop:"))
 async def stop_callback(client, callback_query: CallbackQuery):
     try:
@@ -456,7 +469,7 @@ async def stop_callback(client, callback_query: CallbackQuery):
 
     task.cancelled = True
     try:
-        download = aria2.get_download(gid)
+        download = aria2.get_download(task.gid)
         aria2.remove([download], force=True, files=True)
         cleanup_files(task)
     except Exception as e:
@@ -468,7 +481,7 @@ async def stop_callback(client, callback_query: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Download progress loop  ── writes into task.dl every tick
+#  Engines: Download, Extract, Upload
 # ─────────────────────────────────────────────────────────────────────────────
 async def update_progress(task: DownloadTask, message):
     try:
@@ -492,7 +505,6 @@ async def update_progress(task: DownloadTask, message):
                 elapsed    = time.time() - task.start_time
                 filename   = clean_filename(download.name if download.name else "Connecting…")
 
-                # write live snapshot — Refresh reads this directly
                 task.filename  = filename
                 task.file_size = total_size
                 task.dl.update({
@@ -503,9 +515,7 @@ async def update_progress(task: DownloadTask, message):
                 try:
                     seeders = getattr(download, 'num_seeders', None)
                     if seeders and seeders > 0:
-                        task.dl["peer_line"] = (
-                            f"├ **Seeders** → {seeders} | **Leechers** → {download.connections or 0}\n"
-                        )
+                        task.dl["peer_line"] = f"├ **Seeders** → {seeders} | **Leechers** → {download.connections or 0}\n"
                     else:
                         task.dl["peer_line"] = f"├ **Connections** → {download.connections or 0}\n"
                 except Exception:
@@ -519,13 +529,10 @@ async def update_progress(task: DownloadTask, message):
                 if update_count % 3 == 0 or progress >= 100:
                     user_label = get_user_label(message, task)
                     text = build_dl_text(task, user_label)
-                    await safe_edit_message(
-                        message, text, task,
-                        reply_markup=stop_keyboard(task.gid, "dl")
-                    )
+                    await safe_edit_message(message, text, task, reply_markup=stop_keyboard(task.gid, "dl"))
 
             except Exception as iter_err:
-                print(f"Progress iteration error: {iter_err}")
+                pass # GID might be switching, perfectly normal, it will retry
 
             update_count += 1
             await asyncio.sleep(3)
@@ -533,10 +540,6 @@ async def update_progress(task: DownloadTask, message):
     except Exception as e:
         print(f"Progress update error: {e}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Extraction  ── writes into task.ext every tick
-# ─────────────────────────────────────────────────────────────────────────────
 async def extract_archive(file_path, extract_to, status_msg=None, task=None):
     try:
         raw_name   = os.path.basename(file_path)
@@ -547,9 +550,7 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
 
         if task:
             task.current_phase = "ext"
-            task.ext.update({
-                "filename": filename, "archive_size": total_size, "total": total_size
-            })
+            task.ext.update({"filename": filename, "archive_size": total_size, "total": total_size})
 
         async def _render(extracted_bytes, total_bytes, current_file, file_index, total_files):
             now = time.time()
@@ -563,7 +564,6 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
             pct       = min((extracted_bytes / total_bytes) * 100, 100) if total_bytes > 0 else 0
             cur_clean = clean_filename(os.path.basename(current_file))
 
-            # write live snapshot
             if task:
                 task.ext.update({
                     "pct": pct, "speed": speed,
@@ -577,15 +577,10 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
                 user_label = get_user_label(status_msg, task) if task else "Unknown"
                 text = build_ext_text(task, user_label)
                 gid  = task.gid if task else "unknown"
-                await safe_edit_message(
-                    status_msg, text, task,
-                    reply_markup=refresh_only_keyboard(gid, "ext")
-                )
+                await safe_edit_message(status_msg, text, task, reply_markup=refresh_only_keyboard(gid, "ext"))
 
-        # ── ZIP ───────────────────────────────────────────────────────────────
         if file_path.endswith('.zip'):
             loop = asyncio.get_event_loop()
-
             def extract_zip():
                 with zipfile.ZipFile(file_path, 'r') as zf:
                     members   = zf.infolist()
@@ -596,14 +591,10 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
                         zf.extract(member, extract_to)
                         extracted += member.file_size
                         if idx % 5 == 0 or idx == n_files:
-                            asyncio.run_coroutine_threadsafe(
-                                _render(extracted, unc_total, member.filename, idx, n_files), loop
-                            )
+                            asyncio.run_coroutine_threadsafe(_render(extracted, unc_total, member.filename, idx, n_files), loop)
                 return True
-
             return await loop.run_in_executor(executor, extract_zip)
 
-        # ── 7z ───────────────────────────────────────────────────────────────
         elif file_path.endswith('.7z'):
             with py7zr.SevenZipFile(file_path, mode='r') as archive:
                 members   = archive.list()
@@ -625,27 +616,22 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
                         update_tick     += 1
                         if update_tick % 5 == 0:
                             asyncio.run_coroutine_threadsafe(
-                                _render(extracted_bytes, total_unc or total_size,
-                                        filename, s.file_index, n_files),
-                                s.loop
+                                _render(extracted_bytes, total_unc or total_size, filename, s.file_index, n_files), s.loop
                             )
                     def report_postprocess(s): pass
                     def report_warning(s, m): pass
 
                 try:
                     archive.extractall(path=extract_to, callback=_CB())
-                    await _render(total_unc or total_size, total_unc or total_size,
-                                  filename, n_files, n_files)
+                    await _render(total_unc or total_size, total_unc or total_size, filename, n_files, n_files)
                 except TypeError:
                     archive.extractall(path=extract_to)
                     await _render(total_size, total_size, filename, 1, 1)
                 return True
 
-        # ── TAR ───────────────────────────────────────────────────────────────
         elif file_path.endswith(('.tar.gz', '.tgz', '.tar')):
             import tarfile
             loop = asyncio.get_event_loop()
-
             def extract_tar():
                 with tarfile.open(file_path, 'r:*') as tf:
                     members   = tf.getmembers()
@@ -656,11 +642,8 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
                         tf.extract(member, extract_to)
                         extracted += member.size
                         if idx % 5 == 0 or idx == n_files:
-                            asyncio.run_coroutine_threadsafe(
-                                _render(extracted, total_unc, member.name, idx, n_files), loop
-                            )
+                            asyncio.run_coroutine_threadsafe(_render(extracted, total_unc, member.name, idx, n_files), loop)
                 return True
-
             return await loop.run_in_executor(executor, extract_tar)
         else:
             return False
@@ -669,14 +652,13 @@ async def extract_archive(file_path, extract_to, status_msg=None, task=None):
         print(f"Extraction error: {e}")
         return False
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Upload  ── writes into task.ul every tick
-# ─────────────────────────────────────────────────────────────────────────────
 async def upload_to_telegram(file_path, message, caption="", status_msg=None, task=None):
-
     if task:
         task.current_phase = "ul"
+
+    user_id = message.from_user.id
+    as_video = user_settings.get(user_id, {}).get("as_video", False)
+    video_exts = ('.mp4', '.mkv', '.avi', '.webm')
 
     try:
         gid_full  = task.gid     if task else "unknown"
@@ -690,6 +672,7 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
                 return False
 
             raw_name   = os.path.basename(file_path)
+            clean_name = clean_filename(raw_name)
             start_time = time.time()
             last_render_time = [0.0]
             last_uploaded    = [0]
@@ -707,10 +690,8 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
             async def _progress(current, total):
                 now     = time.time()
                 elapsed = now - start_time
-
                 if now - last_render_time[0] < 5:
                     return
-
                 dt    = now - last_tick_time[0]
                 speed = (current - last_uploaded[0]) / dt if dt > 0 else 0
                 eta   = (total - current) / speed if speed > 0 else 0
@@ -719,40 +700,41 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
                 last_uploaded[0]    = current
                 last_render_time[0] = now
 
-                # write live snapshot — Refresh reads this directly
                 if task:
                     task.ul.update({
-                        "filename": raw_name,
-                        "uploaded": current, "total": total,
+                        "filename": raw_name, "uploaded": current, "total": total,
                         "speed": speed, "elapsed": elapsed, "eta": eta,
                         "file_index": 1, "total_files": 1,
                     })
 
                 text = build_ul_text(task, user_label)
-                await safe_edit_message(
-                    status_msg, text, task,
-                    reply_markup=stop_keyboard(gid_full, "ul")
+                await safe_edit_message(status_msg, text, task, reply_markup=stop_keyboard(gid_full, "ul"))
+
+            text = build_ul_text(task, user_label)
+            await safe_edit_message(status_msg, text, task, reply_markup=stop_keyboard(gid_full, "ul"))
+
+            # Determine Upload Mode
+            is_video_file = file_path.lower().endswith(video_exts)
+            final_caption = caption or clean_name
+
+            if as_video and is_video_file:
+                await message.reply_video(
+                    video=file_path,
+                    caption=final_caption,
+                    progress=_progress,
+                    supports_streaming=True,
+                    disable_notification=True
+                )
+            else:
+                await message.reply_document(
+                    document=file_path,
+                    caption=final_caption,
+                    progress=_progress,
+                    disable_notification=True
                 )
 
-            # Initial 0% render
-            text = build_ul_text(task, user_label)
-            await safe_edit_message(
-                status_msg, text, task,
-                reply_markup=stop_keyboard(gid_full, "ul")
-            )
-
-            await message.reply_document(
-                document=file_path,
-                caption=caption or clean_filename(raw_name),
-                progress=_progress,
-                disable_notification=True
-            )
-
-            elapsed = time.time() - start_time
             if task:
-                task.ul.update({
-                    "uploaded": file_size, "speed": 0, "elapsed": elapsed, "eta": 0
-                })
+                task.ul.update({"uploaded": file_size, "speed": 0, "elapsed": time.time() - start_time, "eta": 0})
             return True
 
         # ── Directory (multi-file) ─────────────────────────────────────────────
@@ -775,10 +757,8 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
 
             if task:
                 task.ul.update({
-                    "total_files": total_files,
-                    "file_map":    file_map,
-                    "file_list":   file_list,
-                    "elapsed":     0,
+                    "total_files": total_files, "file_map": file_map,
+                    "file_list": file_list, "elapsed": 0,
                 })
 
             user_label = get_user_label(message, task) if task else "Unknown"
@@ -792,10 +772,7 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
                     task.ul["elapsed"]  = now - start_time
                     task.ul["file_map"] = file_map
                 text = build_ul_text(task, user_label)
-                await safe_edit_message(
-                    status_msg, text, task,
-                    reply_markup=stop_keyboard(gid_full, "ul")
-                )
+                await safe_edit_message(status_msg, text, task, reply_markup=stop_keyboard(gid_full, "ul"))
 
             async def _upload_one(file_index, fpath):
                 fsize     = os.path.getsize(fpath)
@@ -804,24 +781,37 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
 
                 async def _progress(current, total):
                     file_map[file_index] = (current, total)
-                    if task:
-                        task.ul["file_map"] = file_map
+                    if task: task.ul["file_map"] = file_map
                     if time.time() - last_render[0] >= 10:
                         await _render_multi()
 
                 file_map[file_index] = (0, fsize)
-                await message.reply_document(
-                    document=fpath,
-                    caption=f"📄 {clean_cap}  [{file_index}/{total_files}]" + (f"\n{caption}" if caption else ""),
-                    progress=_progress,
-                    disable_notification=True
-                )
+                
+                # Determine Upload Mode for batch files
+                is_video_file = fpath.lower().endswith(video_exts)
+                batch_caption = f"📄 {clean_cap}  [{file_index}/{total_files}]" + (f"\n{caption}" if caption else "")
+
+                if as_video and is_video_file:
+                    await message.reply_video(
+                        video=fpath,
+                        caption=batch_caption,
+                        progress=_progress,
+                        supports_streaming=True,
+                        disable_notification=True
+                    )
+                else:
+                    await message.reply_document(
+                        document=fpath,
+                        caption=batch_caption,
+                        progress=_progress,
+                        disable_notification=True
+                    )
+                
                 file_map[file_index] = (fsize, fsize)
 
             await _render_multi()
 
-            semaphore = asyncio.Semaphore(3)
-
+            semaphore = asyncio.Semaphore(5)
             async def _upload_with_limit(idx, fp):
                 async with semaphore:
                     return await _upload_one(idx, fp)
@@ -836,124 +826,257 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
         await message.reply_text(f"❌ Upload error: {str(e)}")
         return False
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  Bot commands
+#  Core Processing Engine (Handles Links, Magnets & Torrents)
 # ─────────────────────────────────────────────────────────────────────────────
-@app.on_message(filters.command(["start", "help"]))
-async def start_command(client, message: Message):
-    help_text = (
-        "**🤖 Leech Bot - Help**\n\n"
-        "**📥 Download Commands:**\n"
-        "• `/leech <link>` - Download direct link\n"
-        "• `/l <link>` - Short for /leech\n"
-        "• `/leech <link> -e` - Download & extract archive\n\n"
-        f"**✨ Features:**\n"
-        f"✓ Direct links (HTTP/HTTPS/FTP)\n"
-        f"✓ Auto extraction (.zip, .7z, .tar.gz)\n"
-        f"✓ Live progress — Download / Extract / Upload\n"
-        f"✓ 🔄 **Refresh** — tap to get live stats instantly\n"
-        f"✓ 🛑 **Stop** — cancel task from inline button\n"
-        f"✓ Concurrent multi-file uploads\n"
-        f"✓ CPU / RAM / Disk monitoring\n"
-        f"✓ Auto cleanup after upload\n"
-        f"✓ Site-name prefix auto-removed from filenames\n"
-        f"✓ Max upload: **{MAX_UPLOAD_LABEL}** ({'Premium ⭐' if OWNER_PREMIUM else 'Standard'})\n\n"
-        "**📖 Examples:**\n"
-        "`/leech https://example.com/file.zip`\n"
-        "`/l https://example.com/archive.7z -e`\n"
-    )
-    await message.reply_text(help_text)
+async def process_task_execution(message: Message, status_msg: Message, download, extract: bool):
+    """Runs completely in the background so the bot never waits for one to finish."""
+    gid = download.gid
+    task = DownloadTask(gid, message.from_user.id, status_msg.id, extract)
+    active_downloads[gid] = task
 
-
-@app.on_message(filters.command(["leech", "l"]))
-async def leech_command(client, message: Message):
-    gid  = None
-    task = None
     try:
-        args = message.text.split(maxsplit=1)
-        if len(args) < 2:
-            await message.reply_text("❌ **Usage:** `/leech <link>` or `/leech <link> -e`")
-            return
+        # Start UI updater
+        asyncio.create_task(update_progress(task, status_msg))
 
-        url     = args[1].split()[0]
-        extract = "-e" in message.text.lower()
+        # Wait until download is complete
+        while not task.cancelled:
+            await asyncio.sleep(2)
+            
+            try:
+                current_download = aria2.get_download(task.gid)
+            except Exception:
+                break
 
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        status_msg = await message.reply_text("🔄 **Starting download...**")
+            # MAGNET LINK / TORRENT METADATA GID SWITCHER
+            followed_by = getattr(current_download, 'followed_by', None)
+            if followed_by:
+                new_gid = followed_by[0].gid if hasattr(followed_by[0], 'gid') else followed_by[0]
+                
+                old_gid = task.gid
+                task.gid = new_gid
+                
+                active_downloads[new_gid] = task
+                active_downloads.pop(old_gid, None)
+                continue
 
-        try:
-            download = aria2.add_uris([url], options={"dir": DOWNLOAD_DIR})
-            gid      = download.gid
-            task     = DownloadTask(gid, message.from_user.id, status_msg.id, extract)
-            active_downloads[gid] = task
-
-            asyncio.create_task(update_progress(task, status_msg))
-
-            while not download.is_complete and not task.cancelled:
-                await asyncio.sleep(1)
-                download.update()
-
-            if task.cancelled:
-                await safe_edit_message(status_msg, "❌ **Download cancelled**\n🧹 **Cleaning up...**", task)
-                try:
-                    aria2.remove([download], force=True, files=True)
-                except Exception:
-                    pass
+            if current_download.is_complete:
+                break
+            elif getattr(current_download, 'has_failed', False):
+                await safe_edit_message(status_msg, f"❌ **Aria2 Error:** `{current_download.error_message}`", task)
                 cleanup_files(task)
-                active_downloads.pop(gid, None)
-                await safe_edit_message(status_msg, "❌ **Download cancelled**\n✅ **Files cleaned up!**", task)
+                active_downloads.pop(task.gid, None)
                 return
 
-            await safe_edit_message(
-                status_msg, "✅ **Download completed!**\n📤 **Starting upload...**", task
-            )
-            download.update()
-            file_path      = os.path.join(DOWNLOAD_DIR, download.name)
-            task.file_path = file_path
-
-            if extract and file_path.endswith(('.zip', '.7z', '.tar.gz', '.tgz', '.tar')):
-                extract_dir      = os.path.join(DOWNLOAD_DIR, f"extracted_{int(time.time())}")
-                os.makedirs(extract_dir, exist_ok=True)
-                task.extract_dir = extract_dir
-                await safe_edit_message(status_msg, "📦 **Starting extraction...**", task)
-                if await extract_archive(file_path, extract_dir, status_msg=status_msg, task=task):
-                    await safe_edit_message(
-                        status_msg, "✅ **Extraction done!**\n📤 **Uploading to Telegram...**", task
-                    )
-                    await upload_to_telegram(
-                        extract_dir, message,
-                        caption="📁 Extracted files",
-                        status_msg=status_msg, task=task
-                    )
-                else:
-                    await safe_edit_message(
-                        status_msg, "❌ **Extraction failed!** Uploading original...", task
-                    )
-                    await upload_to_telegram(file_path, message, status_msg=status_msg, task=task)
-            else:
-                await upload_to_telegram(file_path, message, status_msg=status_msg, task=task)
-
-            await safe_edit_message(
-                status_msg, "✅ **Upload completed!**\n🧹 **Cleaning up files...**", task
-            )
+        if task.cancelled:
+            await safe_edit_message(status_msg, "❌ **Download cancelled**\n🧹 **Cleaning up...**", task)
+            try: aria2.remove([aria2.get_download(task.gid)], force=True, files=True)
+            except: pass
             cleanup_files(task)
-            await safe_edit_message(status_msg, "✅ **Task completed successfully!**", task)
-            active_downloads.pop(gid, None)
+            active_downloads.pop(task.gid, None)
+            return
 
-        except Exception as e:
-            await safe_edit_message(
-                status_msg, f"❌ **Error:** `{str(e)}`\n🧹 **Cleaning up...**", task
-            )
-            if task:
-                cleanup_files(task)
-            active_downloads.pop(gid, None)
+        await safe_edit_message(status_msg, "✅ **Download completed!**\n📤 **Starting upload...**", task)
+        
+        # Get the final filename and path
+        try:
+            final_download = aria2.get_download(task.gid)
+            file_path = os.path.join(DOWNLOAD_DIR, final_download.name)
+        except:
+            file_path = os.path.join(DOWNLOAD_DIR, task.dl["filename"])
+            
+        task.file_path = file_path
+
+        # Extraction logic
+        if extract and file_path.endswith(('.zip', '.7z', '.tar.gz', '.tgz', '.tar')):
+            extract_dir = os.path.join(DOWNLOAD_DIR, f"extracted_{int(time.time())}")
+            os.makedirs(extract_dir, exist_ok=True)
+            task.extract_dir = extract_dir
+            await safe_edit_message(status_msg, "📦 **Starting extraction...**", task)
+            
+            if await extract_archive(file_path, extract_dir, status_msg=status_msg, task=task):
+                await safe_edit_message(status_msg, "✅ **Extraction done!**\n📤 **Uploading to Telegram...**", task)
+                await upload_to_telegram(extract_dir, message, caption="📁 Extracted files", status_msg=status_msg, task=task)
+            else:
+                await safe_edit_message(status_msg, "❌ **Extraction failed!** Uploading original...", task)
+                await upload_to_telegram(file_path, message, status_msg=status_msg, task=task)
+        else:
+            await upload_to_telegram(file_path, message, status_msg=status_msg, task=task)
+
+        await safe_edit_message(status_msg, "✅ **Upload completed!**\n🧹 **Cleaning up files...**", task)
+        cleanup_files(task)
+        active_downloads.pop(task.gid, None)
 
     except Exception as e:
-        await message.reply_text(f"❌ **Error:** `{str(e)}`")
-        if task:
-            cleanup_files(task)
-        active_downloads.pop(gid, None)
+        await safe_edit_message(status_msg, f"❌ **Error:** `{str(e)}`\n🧹 **Cleaning up...**", task)
+        cleanup_files(task)
+        active_downloads.pop(task.gid, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Universal Command Handler (/leech, /l, /ql)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.on_message(filters.command(["leech", "l", "ql"]))
+async def universal_leech_command(client, message: Message):
+    extract = "-e" in message.text.lower()
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    # 1. Check if the user is replying to a .torrent file
+    if message.reply_to_message and message.reply_to_message.document:
+        doc = message.reply_to_message.document
+        if doc.file_name.endswith(".torrent"):
+            status_msg = await message.reply_text("🔄 **Downloading torrent metadata...**")
+            torrent_path = os.path.join(DOWNLOAD_DIR, f"{message.id}_{doc.file_name}")
+            
+            await message.reply_to_message.download(file_name=torrent_path)
+            download = aria2.add_torrent(torrent_path, options=BT_OPTIONS)
+            
+            # Detach process to run in background so the bot doesn't freeze
+            asyncio.create_task(process_task_execution(message, status_msg, download, extract))
+            return
+
+    # 2. Process all links/magnets provided in the message text
+    args = message.text.split()[1:]
+    links = [arg for arg in args if arg.startswith("http") or arg.startswith("magnet:")]
+
+    if not links:
+        await message.reply_text("❌ **Usage:** `/ql <link1> <magnet2>` or reply to a `.torrent` file.\n ❌ **Usage:** `/l <link>` to dwld direct links ")
+        return
+
+    # Start all downloads concurrently
+    for link in links:
+        status_msg = await message.reply_text("🔄 **Adding to download queue...**")
+        try:
+            download = aria2.add_uris([link], options=BT_OPTIONS)
+            # Spawn a background task for each link so they share network speed simultaneously
+            asyncio.create_task(process_task_execution(message, status_msg, download, extract))
+        except Exception as e:
+            await safe_edit_message(status_msg, f"❌ **Failed to add link:** `{str(e)}`")
+# ─────────────────────────────────────────────────────────────────────────────
+#  Start Command
+# ─────────────────────────────────────────────────────────────────────────────
+@app.on_message(filters.command(["start"]))
+async def start_command(client, message: Message):
+    strt_txt = (
+        "**🤖 Welcome to the Advanced Leech Bot!**\n\n"
+        "I can download direct links, magnets, and `.torrent` files, and upload them directly to Telegram for you.\n\n"
+        "Type /help to see all my features and commands.\n\n"
+        "© Maintained By @im_goutham_josh"
+    )
+    
+    # Optional: A clean keyboard to quickly access settings or close the message
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Configure Upload Settings", callback_data=f"toggle_mode:{message.from_user.id}")],
+        [InlineKeyboardButton("🗑 Close", callback_data="close_help")]
+    ])
+    
+    await message.reply_text(strt_txt, reply_markup=kb)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Help Command
+# ─────────────────────────────────────────────────────────────────────────────
+@app.on_message(filters.command(["help"]))
+async def help_command(client, message: Message):
+    help_txt = (
+        "**📖 Leech Bot - Help & Commands**\n\n"
+        "**📥 Main Commands:**\n"
+        "• `/ql <link1> <magnet2>` - Quick Leech (Download multiple links at once)\n"
+        "• `/leech <link>` - Standard download\n"
+        "• `/leech <link> -e` - Download & extract an archive (.zip, .7z, .tar)\n"
+        "• **Upload a `.torrent` file** - Reply to it with `/ql` to begin\n\n"
+        "**⚙️ Preferences & Control:**\n"
+        "• `/settings` - Toggle between **📄 Document** and **🎬 Video** upload modes\n"
+        "• `/stop <task_id>` - Cancel an active download/upload\n\n"
+        "**✨ Features Active:**\n"
+        "✓ Concurrent Multi-Downloading\n"
+        "✓ Smart Filename Cleaning (Removes site URLs)\n"
+        "✓ Auto-Extraction\n"
+        "✓ High-Speed Telegram Uploads"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Close", callback_data="close_help")]
+    ])
+    
+    await message.reply_text(help_txt, reply_markup=kb)
+
+# Add a quick callback to handle the "Close" button
+@app.on_callback_query(filters.regex(r"^close_help$"))
+async def close_help_callback(client, callback_query: CallbackQuery):
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
+@app.on_message(filters.command(["settings"]))
+async def settings_command(client, message: Message):
+    user_id = message.from_user.id
+    # Default to False (Document mode) if not set
+    as_video = user_settings.get(user_id, {}).get("as_video", False)
+    
+    mode_text = "🎬 Video (Playable)" if as_video else "📄 Document (File)"
+    
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"Toggle Mode: {mode_text}", callback_data=f"toggle_mode:{user_id}")
+    ]])
+    
+    await message.reply_text(
+        "⚙️ **Upload Settings**\n\n"
+        "Choose how media files (.mp4, .mkv, .webm) should be sent to Telegram.",
+        reply_markup=kb
+    )
+
+@app.on_callback_query(filters.regex(r"^toggle_mode:"))
+async def toggle_mode_callback(client, callback_query: CallbackQuery):
+    _, user_id_str = callback_query.data.split(":")
+    user_id = int(user_id_str)
+    
+    if callback_query.from_user.id != user_id:
+        await callback_query.answer("❌ These aren't your settings!", show_alert=True)
+        return
+
+    # Toggle the setting
+    current_setting = user_settings.get(user_id, {}).get("as_video", False)
+    new_setting = not current_setting
+    
+    if user_id not in user_settings:
+        user_settings[user_id] = {}
+    user_settings[user_id]["as_video"] = new_setting
+    
+    mode_text = "🎬 Video (Playable)" if new_setting else "📄 Document (File)"
+    
+    # Rebuild the keyboard WITH the Close button included this time
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Toggle Mode: {mode_text}", callback_data=f"toggle_mode:{user_id}")],
+        [InlineKeyboardButton("🗑 Close", callback_data="close_help")]
+    ])
+    
+    await callback_query.edit_message_reply_markup(reply_markup=kb)
+    await callback_query.answer(f"✅ Mode switched to {mode_text}!")
+
+@app.on_message(filters.document)
+async def handle_torrent_document(client, message: Message):
+    # Check if the uploaded document is a .torrent file
+    if not message.document.file_name.endswith(".torrent"):
+        return
+
+    try:
+        extract = "-e" in (message.caption or "").lower()
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        status_msg = await message.reply_text("🔄 **Downloading torrent file...**")
+
+        # 1. Download the .torrent file to the server
+        torrent_file_path = os.path.join(DOWNLOAD_DIR, f"{message.id}_{message.document.file_name}")
+        await message.download(file_name=torrent_file_path)
+        
+        await safe_edit_message(status_msg, "🔄 **Fetching Peers & Metadata...**")
+
+        # 2. Add it to Aria2
+        download = aria2.add_torrent(torrent_file_path, options=BT_OPTIONS)
+        await process_task_execution(message, status_msg, download, extract)
+
+    except Exception as e:
+        await message.reply_text(f"❌ **Error processing torrent:** `{str(e)}`")
 
 
 @app.on_message(filters.command(["stop"]) | filters.regex(r"^/stop_\w+"))
@@ -982,13 +1105,14 @@ async def stop_command(client, message: Message):
 
         found_task.cancelled = True
         try:
-            download = aria2.get_download(found_gid)
+            download = aria2.get_download(found_task.gid)
             aria2.remove([download], force=True, files=True)
             cleanup_files(found_task)
         except Exception as e:
             print(f"Stop error: {e}")
 
         active_downloads.pop(found_gid, None)
+        active_downloads.pop(found_task.gid, None)
         await message.reply_text(f"✅ **Task `{gid_short}` cancelled & files cleaned!**")
 
     except Exception as e:
@@ -996,7 +1120,7 @@ async def stop_command(client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Koyeb keep-alive
+#  Keep-alive
 # ─────────────────────────────────────────────────────────────────────────────
 async def health_handler(request):
     return web.Response(
