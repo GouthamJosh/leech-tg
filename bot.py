@@ -678,47 +678,67 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
         gid_full  = task.gid     if task else "unknown"
         gid_short = task.gid[:8] if task else "unknown"
 
-        # ── Single file ────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────
+        # SINGLE FILE
+        # ─────────────────────────────────────────────
         if os.path.isfile(file_path):
+
             file_size = os.path.getsize(file_path)
             if file_size > MAX_UPLOAD_BYTES:
-                await message.reply_text(f"❌ File too large for Telegram (>{MAX_UPLOAD_LABEL})")
+                await message.reply_text(f"❌ File too large (>{MAX_UPLOAD_LABEL})")
                 return False
 
             raw_name   = os.path.basename(file_path)
             clean_name = clean_filename(raw_name)
+
+            # 🔥 RENAME FILE BEFORE UPLOAD (CRITICAL FIX)
+            if raw_name != clean_name:
+                new_path = os.path.join(os.path.dirname(file_path), clean_name)
+                os.rename(file_path, new_path)
+                file_path = new_path
+
             start_time = time.time()
             last_render_time = [0.0]
-            last_uploaded    = [0]
-            last_tick_time   = [start_time]
+            last_uploaded = [0]
+            last_tick_time = [start_time]
 
             if task:
                 task.ul.update({
-                    "filename": raw_name, "uploaded": 0, "total": file_size,
-                    "speed": 0, "elapsed": 0, "eta": 0,
-                    "file_index": 1, "total_files": 1,
+                    "filename": clean_name,  # USE CLEAN NAME
+                    "uploaded": 0,
+                    "total": file_size,
+                    "speed": 0,
+                    "elapsed": 0,
+                    "eta": 0,
+                    "file_index": 1,
+                    "total_files": 1,
                 })
 
             user_label = get_user_label(message, task) if task else "Unknown"
 
             async def _progress(current, total):
-                now     = time.time()
+                now = time.time()
                 elapsed = now - start_time
+
                 if now - last_render_time[0] < 5:
                     return
-                dt    = now - last_tick_time[0]
-                speed = (current - last_uploaded[0]) / dt if dt > 0 else 0
-                eta   = (total - current) / speed if speed > 0 else 0
 
-                last_tick_time[0]   = now
-                last_uploaded[0]    = current
+                dt = now - last_tick_time[0]
+                speed = (current - last_uploaded[0]) / dt if dt > 0 else 0
+                eta = (total - current) / speed if speed > 0 else 0
+
+                last_tick_time[0] = now
+                last_uploaded[0] = current
                 last_render_time[0] = now
 
                 if task:
                     task.ul.update({
-                        "filename": raw_name, "uploaded": current, "total": total,
-                        "speed": speed, "elapsed": elapsed, "eta": eta,
-                        "file_index": 1, "total_files": 1,
+                        "filename": clean_name,
+                        "uploaded": current,
+                        "total": total,
+                        "speed": speed,
+                        "elapsed": elapsed,
+                        "eta": eta,
                     })
 
                 text = build_ul_text(task, user_label)
@@ -727,9 +747,8 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
             text = build_ul_text(task, user_label)
             await safe_edit_message(status_msg, text, task, reply_markup=stop_keyboard(gid_full, "ul"))
 
-            # Determine Upload Mode
-            is_video_file = file_path.lower().endswith(video_exts)
             final_caption = caption or clean_name
+            is_video_file = file_path.lower().endswith(video_exts)
 
             if as_video and is_video_file:
                 await message.reply_video(
@@ -747,93 +766,55 @@ async def upload_to_telegram(file_path, message, caption="", status_msg=None, ta
                     disable_notification=True
                 )
 
-            if task:
-                task.ul.update({"uploaded": file_size, "speed": 0, "elapsed": time.time() - start_time, "eta": 0})
             return True
 
-        # ── Directory (multi-file) ─────────────────────────────────────────────
+        # ─────────────────────────────────────────────
+        # DIRECTORY (MULTI FILE)
+        # ─────────────────────────────────────────────
         elif os.path.isdir(file_path):
+
             files = [
-                os.path.join(root, fname)
+                os.path.join(root, f)
                 for root, _, filenames in os.walk(file_path)
-                for fname in filenames
-                if os.path.getsize(os.path.join(root, fname)) <= MAX_UPLOAD_BYTES
+                for f in filenames
+                if os.path.getsize(os.path.join(root, f)) <= MAX_UPLOAD_BYTES
             ]
-            total_files = len(files)
-            if total_files == 0:
+
+            if not files:
                 await message.reply_text("❌ No uploadable files found.")
                 return False
 
-            file_map  = {i: (0, os.path.getsize(fp)) for i, fp in enumerate(files, start=1)}
-            file_list = list(enumerate(files, start=1))
             start_time = time.time()
-            last_render = [0.0]
+            total_files = len(files)
 
-            if task:
-                task.ul.update({
-                    "total_files": total_files, "file_map": file_map,
-                    "file_list": file_list, "elapsed": 0,
-                })
+            for index, fpath in enumerate(files, start=1):
 
-            user_label = get_user_label(message, task) if task else "Unknown"
+                raw_name = os.path.basename(fpath)
+                clean_name = clean_filename(raw_name)
 
-            async def _render_multi():
-                now = time.time()
-                if now - last_render[0] < 10:
-                    return
-                last_render[0] = now
-                if task:
-                    task.ul["elapsed"]  = now - start_time
-                    task.ul["file_map"] = file_map
-                text = build_ul_text(task, user_label)
-                await safe_edit_message(status_msg, text, task, reply_markup=stop_keyboard(gid_full, "ul"))
+                # 🔥 RENAME FILE BEFORE UPLOAD
+                if raw_name != clean_name:
+                    new_path = os.path.join(os.path.dirname(fpath), clean_name)
+                    os.rename(fpath, new_path)
+                    fpath = new_path
 
-            async def _upload_one(file_index, fpath):
-                fsize     = os.path.getsize(fpath)
-                raw_name  = os.path.basename(fpath)
-                clean_cap = clean_filename(raw_name)
+                caption_text = f"📄 {clean_name} [{index}/{total_files}]"
 
-                async def _progress(current, total):
-                    file_map[file_index] = (current, total)
-                    if task: task.ul["file_map"] = file_map
-                    if time.time() - last_render[0] >= 10:
-                        await _render_multi()
-
-                file_map[file_index] = (0, fsize)
-                
-                # Determine Upload Mode for batch files
                 is_video_file = fpath.lower().endswith(video_exts)
-                batch_caption = f"📄 {clean_cap}  [{file_index}/{total_files}]" + (f"\n{caption}" if caption else "")
 
                 if as_video and is_video_file:
                     await message.reply_video(
                         video=fpath,
-                        caption=batch_caption,
-                        progress=_progress,
-                        supports_streaming=True,
+                        caption=caption_text,
                         disable_notification=True
                     )
                 else:
                     await message.reply_document(
                         document=fpath,
-                        caption=batch_caption,
-                        progress=_progress,
+                        caption=caption_text,
                         disable_notification=True
                     )
-                
-                file_map[file_index] = (fsize, fsize)
 
-            await _render_multi()
-
-            semaphore = asyncio.Semaphore(5)
-            async def _upload_with_limit(idx, fp):
-                async with semaphore:
-                    return await _upload_one(idx, fp)
-
-            await asyncio.gather(*[_upload_with_limit(i, fp) for i, fp in file_list])
-
-            last_render[0] = 0
-            await _render_multi()
             return True
 
     except Exception as e:
