@@ -148,15 +148,29 @@ class DownloadTask:
 #  Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def clean_filename(filename: str) -> str:
-    """Aggressively removes website URLs, tags, and Telegram handles from the start of the file."""
+    """Aggressively removes website URLs, tags, and Telegram handles, and ensures the name isn't too long."""
     # 1. Remove [AnyText] or (AnyText) at the start
     cleaned = re.sub(r'^\[.*?\]\s*|^\(.*?\)\s*', '', filename)
     # 2. Remove @ChannelName at the start
     cleaned = re.sub(r'^@\w+\s*', '', cleaned)
-    # 3. Remove www.site.com or site.mkv prefixes (with optional hyphens/underscores)
+    # 3. Remove www.site.com or site.mkv prefixes
     cleaned = re.sub(r'^(?:(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\s*[-–_]*\s*)', '', cleaned, flags=re.IGNORECASE)
     
-    return cleaned.strip() if cleaned.strip() else filename
+    cleaned = cleaned.strip() if cleaned.strip() else filename
+
+    # 4. Limit filename length (e.g., 100 chars), preserving extension
+    max_length = 100
+    if len(cleaned) > max_length:
+        name, ext = os.path.splitext(cleaned)
+        # Calculate how much space is left for the name
+        space_left = max_length - len(ext) - 3 # -3 for "..."
+        if space_left > 0:
+            cleaned = name[:space_left] + "..." + ext
+        else:
+             # Fallback if extension itself is insanely long (rare)
+             cleaned = cleaned[:max_length]
+
+    return cleaned
 
 def create_progress_bar(percentage: float) -> str:
     if percentage >= 100:
