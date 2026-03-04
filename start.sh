@@ -2,90 +2,60 @@
 set -e
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  🤖  Leech Bot — Universal Startup Script"
-echo "  Supports: Koyeb · Render · Railway · JRMA"
+echo "  🤖  Leech Bot — Startup Script"
+echo "  Engine: aioaria2 WebSocket RPC"
+echo "  Supports: Koyeb · Render · Railway · VPS"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# ── Create download directory ─────────────────────────────────────────────────
 mkdir -p /tmp/downloads
 
-# ── Detect environment ───────────────────────────────────────────────────────
 ARCH=$(uname -m)
 OS=$(uname -s)
 echo "🖥️  Architecture: $ARCH | OS: $OS"
 
-# ── Portable command check ───────────────────────────────────────────────────
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# ── Install aria2c (multi-method fallback) ───────────────────────────────────
 install_aria2() {
     echo "⚠️  aria2c not found. Installing..."
 
-    # Method 1: apt-get
     if command_exists apt-get; then
         echo "📦 Trying apt-get..."
         apt-get update -qq 2>/dev/null && apt-get install -y -qq aria2 2>/dev/null && {
-            echo "✅ Installed via apt-get"
-            return 0
+            echo "✅ Installed via apt-get"; return 0
         }
     fi
-
-    # Method 2: apk
     if command_exists apk; then
         echo "📦 Trying apk..."
-        apk add --no-cache aria2 2>/dev/null && {
-            echo "✅ Installed via apk"
-            return 0
-        }
+        apk add --no-cache aria2 2>/dev/null && { echo "✅ Installed via apk"; return 0; }
     fi
-
-    # Method 3: yum/dnf
     if command_exists yum; then
         echo "📦 Trying yum..."
-        yum install -y aria2 2>/dev/null && {
-            echo "✅ Installed via yum"
-            return 0
-        }
+        yum install -y aria2 2>/dev/null && { echo "✅ Installed via yum"; return 0; }
     fi
-
     if command_exists dnf; then
         echo "📦 Trying dnf..."
-        dnf install -y aria2 2>/dev/null && {
-            echo "✅ Installed via dnf"
-            return 0
-        }
+        dnf install -y aria2 2>/dev/null && { echo "✅ Installed via dnf"; return 0; }
     fi
-
-    # Method 4: pacman
     if command_exists pacman; then
         echo "📦 Trying pacman..."
-        pacman -Sy --noconfirm aria2 2>/dev/null && {
-            echo "✅ Installed via pacman"
-            return 0
-        }
+        pacman -Sy --noconfirm aria2 2>/dev/null && { echo "✅ Installed via pacman"; return 0; }
     fi
 
-    # Method 5: Static binary fallback
     echo "📦 Trying static binary..."
     ARIA2_VER="1.37.0"
     mkdir -p /tmp/aria2
 
     case "$ARCH" in
         x86_64|amd64)
-            URL="https://github.com/q3aql/aria2-static-builds/releases/download/v${ARIA2_VER}/aria2-${ARIA2_VER}-linux-gnu-64bit-build1.tar.bz2"
-            ;;
+            URL="https://github.com/q3aql/aria2-static-builds/releases/download/v${ARIA2_VER}/aria2-${ARIA2_VER}-linux-gnu-64bit-build1.tar.bz2" ;;
         aarch64|arm64|armv7l|armhf)
-            URL="https://github.com/q3aql/aria2-static-builds/releases/download/v${ARIA2_VER}/aria2-${ARIA2_VER}-linux-gnu-arm-rbpi-build1.tar.bz2"
-            ;;
+            URL="https://github.com/q3aql/aria2-static-builds/releases/download/v${ARIA2_VER}/aria2-${ARIA2_VER}-linux-gnu-arm-rbpi-build1.tar.bz2" ;;
         i386|i686)
-            URL="https://github.com/q3aql/aria2-static-builds/releases/download/v${ARIA2_VER}/aria2-${ARIA2_VER}-linux-gnu-32bit-build1.tar.bz2"
-            ;;
+            URL="https://github.com/q3aql/aria2-static-builds/releases/download/v${ARIA2_VER}/aria2-${ARIA2_VER}-linux-gnu-32bit-build1.tar.bz2" ;;
         *)
-            echo "❌ Unsupported architecture: $ARCH"
-            return 1
-            ;;
+            echo "❌ Unsupported architecture: $ARCH"; return 1 ;;
     esac
 
     if command_exists curl; then
@@ -93,34 +63,27 @@ install_aria2() {
     elif command_exists wget; then
         wget -q "$URL" -O /tmp/aria2.tar.bz2 2>/dev/null
     else
-        echo "❌ No curl or wget available"
-        return 1
+        echo "❌ No curl or wget available"; return 1
     fi
 
     if [ -f /tmp/aria2.tar.bz2 ]; then
         tar -xjf /tmp/aria2.tar.bz2 -C /tmp/aria2 2>/dev/null
         BINARY=$(find /tmp/aria2 -name "aria2c" -type f 2>/dev/null | head -n1)
-
         if [ -n "$BINARY" ]; then
             if [ -w /usr/local/bin ]; then
-                cp "$BINARY" /usr/local/bin/aria2c
-                chmod +x /usr/local/bin/aria2c
+                cp "$BINARY" /usr/local/bin/aria2c && chmod +x /usr/local/bin/aria2c
             else
-                cp "$BINARY" /tmp/aria2c
-                chmod +x /tmp/aria2c
+                cp "$BINARY" /tmp/aria2c && chmod +x /tmp/aria2c
                 export PATH="/tmp:$PATH"
             fi
             rm -rf /tmp/aria2 /tmp/aria2.tar.bz2
-            echo "✅ Installed static binary"
-            return 0
+            echo "✅ Installed static binary"; return 0
         fi
     fi
 
-    echo "❌ All install methods failed for $ARCH"
-    return 1
+    echo "❌ All install methods failed for $ARCH"; return 1
 }
 
-# ── Ensure aria2c exists ─────────────────────────────────────────────────────
 if ! command_exists aria2c; then
     install_aria2 || exit 1
 fi
@@ -131,44 +94,46 @@ if ! aria2c --version >/dev/null 2>&1; then
     rm -f /usr/local/bin/aria2c /tmp/aria2c
     install_aria2 || exit 1
 fi
-
 echo "✅ aria2c: $(aria2c --version 2>/dev/null | head -n1 | awk '{print $3}')"
 
-# ── Install Python Requirements ──────────────────────────────────────────────
+# ── Python requirements ───────────────────────────────────────────────────────
 echo "📦 Installing Python requirements..."
 
-install_requirements() {
-    if ! command_exists python3; then
-        echo "❌ python3 not found"
-        exit 1
-    fi
+if ! command_exists python3; then
+    echo "❌ python3 not found"; exit 1
+fi
 
-    if command_exists pip3; then
-        PIP_CMD="pip3"
-    elif command_exists pip; then
-        PIP_CMD="pip"
-    else
-        echo "⚠️ pip not found, attempting ensurepip..."
-        python3 -m ensurepip --upgrade 2>/dev/null || true
-        PIP_CMD="python3 -m pip"
-    fi
+if command_exists pip3; then
+    PIP="pip3"
+elif command_exists pip; then
+    PIP="pip"
+else
+    python3 -m ensurepip --upgrade 2>/dev/null || true
+    PIP="python3 -m pip"
+fi
 
-    $PIP_CMD install --upgrade pip setuptools wheel --quiet 2>/dev/null || true
+$PIP install --upgrade pip setuptools wheel --quiet 2>/dev/null || true
 
-    if [ -f requirements.txt ]; then
-        $PIP_CMD install -r requirements.txt --no-cache-dir --quiet || {
-            echo "❌ Failed to install requirements"
-            exit 1
-        }
-        echo "✅ Requirements installed"
-    else
-        echo "⚠️ requirements.txt not found, skipping..."
-    fi
-}
+if [ -f requirements.txt ]; then
+    $PIP install -r requirements.txt --no-cache-dir --quiet || {
+        echo "❌ Failed to install requirements"; exit 1
+    }
+    echo "✅ Requirements installed from requirements.txt"
+else
+    echo "⚠️  No requirements.txt — installing core packages..."
+    $PIP install --quiet --no-cache-dir \
+        "pyrogram==2.2.18" \
+        "aioaria2" \
+        "aiohttp" \
+        "py7zr" \
+        "psutil" \
+        "tgcrypto" \
+        "uvloop" \
+    || true
+    echo "✅ Core packages installed"
+fi
 
-install_requirements
-
-# ── Build tracker list ───────────────────────────────────────────────────────
+# ── Trackers ──────────────────────────────────────────────────────────────────
 TRACKERS="udp://tracker.opentrackr.org:1337/announce"
 TRACKERS="$TRACKERS,udp://tracker.openbittorrent.com:6969/announce"
 TRACKERS="$TRACKERS,http://tracker.openbittorrent.com:80/announce"
@@ -190,37 +155,41 @@ TRACKERS="$TRACKERS,udp://tracker1.bt.moack.co.kr:80/announce"
 TRACKERS="$TRACKERS,udp://open.stealth.si:80/announce"
 TRACKERS="$TRACKERS,udp://tracker.zemoj.com:6969/announce"
 
-# ── Start Aria2c RPC ─────────────────────────────────────────────────────────
-echo "🚀 Starting Aria2c RPC daemon..."
-
-pkill -f "aria2c.*rpc-listen-port=6800" 2>/dev/null || true
-sleep 1
-
+# ── Config from env ───────────────────────────────────────────────────────────
 ARIA2_SECRET="${ARIA2_SECRET:-gjxml}"
 RPC_PORT="${ARIA2_PORT:-6800}"
 
+pkill -f "aria2c.*rpc-listen-port=$RPC_PORT" 2>/dev/null || true
+sleep 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Start Aria2c RPC daemon
+#
+# aioaria2 connects via WebSocket: ws://localhost:6800/jsonrpc
+# aria2c serves BOTH HTTP POST and WebSocket on the same port automatically.
+# --rpc-allow-origin-all is required for the WebSocket upgrade handshake.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "🚀 Starting Aria2c RPC daemon (WS+HTTP on port $RPC_PORT)..."
+
 aria2c \
-    --enable-rpc \
+    --enable-rpc=true \
     --rpc-listen-all=false \
     --rpc-listen-port="$RPC_PORT" \
     --rpc-secret="$ARIA2_SECRET" \
     --rpc-max-request-size=16M \
+    --rpc-allow-origin-all=true \
     --dir=/tmp/downloads \
-    \
-    `# ── General Download ────────────────────────────────` \
+    --disk-cache=64M \
+    --file-allocation=none \
+    --allow-overwrite=true \
+    --auto-file-renaming=false \
+    --continue=true \
     --max-concurrent-downloads=5 \
     --max-connection-per-server=16 \
     --min-split-size=1M \
     --split=16 \
-    --continue=true \
-    --auto-file-renaming=false \
-    --allow-overwrite=true \
-    --disk-cache=64M \
-    --file-allocation=none \
     --max-overall-download-limit=0 \
     --max-overall-upload-limit=1K \
-    \
-    `# ── Torrent / Magnet ────────────────────────────────` \
     --enable-dht=true \
     --enable-dht6=true \
     --dht-listen-port=6881-6889 \
@@ -235,29 +204,36 @@ aria2c \
     --seed-time=0 \
     --follow-torrent=true \
     --bt-tracker="$TRACKERS" \
-    \
-    `# ── Logging ─────────────────────────────────────────` \
     --log-level=warn \
     --daemon=true \
     2>/dev/null || true
 
-echo "⏳ Waiting for RPC on port $RPC_PORT..."
+echo "⏳ Waiting for RPC to come up..."
 sleep 3
 
-# ── Verify RPC is up ─────────────────────────────────────────────────────────
+# ── Verify RPC ────────────────────────────────────────────────────────────────
+RPC_OK=false
+
 if command_exists curl; then
-    ARIA2_STATUS=$(curl -s --max-time 3 \
-        -d '{"jsonrpc":"2.0","id":"check","method":"aria2.getVersion","params":["token:'"$ARIA2_SECRET"'"]}' \
-        http://localhost:"$RPC_PORT"/jsonrpc 2>/dev/null | grep -o '"version"' || true)
-    if [ -n "$ARIA2_STATUS" ]; then
-        echo "✅ Aria2c RPC is live on port $RPC_PORT"
-    else
-        echo "⚠️  Aria2c RPC check inconclusive — proceeding anyway"
+    HTTP_CHECK=$(curl -s --max-time 3 \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"aria2.getVersion\",\"params\":[\"token:${ARIA2_SECRET}\"]}" \
+        "http://localhost:${RPC_PORT}/jsonrpc" 2>/dev/null | grep -o '"version"' || true)
+    if [ -n "$HTTP_CHECK" ]; then
+        echo "✅ HTTP RPC  → live  — http://localhost:${RPC_PORT}/jsonrpc"
+        echo "✅ WS  RPC  → live  — ws://localhost:${RPC_PORT}/jsonrpc"
+        RPC_OK=true
     fi
 fi
 
-# ── Start Bot ────────────────────────────────────────────────────────────────
-echo "🤖 Starting Leech Bot..."
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [ "$RPC_OK" = false ]; then
+    echo "⚠️  RPC check inconclusive — bot will retry on connect"
+fi
 
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  RPC port : $RPC_PORT"
+echo "  WS URL   : ws://localhost:${RPC_PORT}/jsonrpc"
+echo "  Secret   : $ARIA2_SECRET"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🤖 Starting Leech Bot..."
 exec python3 bot.py
