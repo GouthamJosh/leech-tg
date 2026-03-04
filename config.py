@@ -59,8 +59,8 @@ MIN_EDIT_GAP               = int(os.environ.get("MIN_EDIT_GAP", "12"))
 # ─────────────────────────────────────────────────────────────────────────────
 #  Pyrogram Client Settings
 # ─────────────────────────────────────────────────────────────────────────────
-WORKERS                    = int(os.environ.get("WORKERS", "200"))
-MAX_CONCURRENT_TRANSMISSIONS = int(os.environ.get("MAX_CONCURRENT_TRANSMISSIONS", "10"))
+WORKERS                    = int(os.environ.get("WORKERS", "300"))
+MAX_CONCURRENT_TRANSMISSIONS = int(os.environ.get("MAX_CONCURRENT_TRANSMISSIONS", "15"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Aria2 Torrent / BitTorrent Options
