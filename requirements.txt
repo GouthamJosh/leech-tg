@@ -1,6 +1,6 @@
 pyrofork
 TgCrypto
-aria2p
+aioaria2
 aiohttp
 py7zr
 psutil
