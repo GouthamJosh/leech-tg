@@ -51,9 +51,7 @@ user_edit_queues = {}   # {user_id: asyncio.Queue}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DownloadTask — represents one item queued by the user
-# current_phase: "dl" → "ext" (optional) → "ul"
-# done_event: set by aioaria2 event handler when aria2 reports completion
+# DownloadTask
 # ─────────────────────────────────────────────────────────────────────────────
 class DownloadTask:
     def __init__(self, gid: str, user_id: int, extract: bool = False):
@@ -67,9 +65,7 @@ class DownloadTask:
         self.filename      = ""
         self.file_size     = 0
         self.current_phase = "dl"
-        # asyncio.Event — set when aria2 fires onDownloadComplete / onBtDownloadComplete
         self.done_event    = asyncio.Event()
-        # asyncio.Event — set when aria2 fires onDownloadError
         self.error_event   = asyncio.Event()
         self.error_msg     = ""
         self.dl  = {
@@ -168,7 +164,6 @@ def cleanup_files(task: DownloadTask):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # aioaria2 helpers
-# tellStatus returns all values as strings — parse carefully
 # ─────────────────────────────────────────────────────────────────────────────
 async def aria2_tell_status(gid: str) -> dict:
     """Fetch aria2 status dict for one GID. Returns {} on error."""
@@ -187,12 +182,10 @@ def _float(val, default: float = 0.0) -> float:
 
 def parse_name(st: dict) -> str:
     """Extract a human-readable filename from a tellStatus dict."""
-    # BitTorrent name
     bt = st.get("bittorrent", {})
     info = bt.get("info", {})
     if info.get("name"):
         return clean_filename(info["name"])
-    # Direct download — use first file path
     files = st.get("files", [])
     if files:
         p = files[0].get("path", "")
@@ -200,18 +193,47 @@ def parse_name(st: dict) -> str:
             return clean_filename(os.path.basename(p))
     return "Connecting..."
 
+# ── FIX 4: parse_file_path now correctly handles multi-file torrents ──────────
 def parse_file_path(st: dict) -> str:
-    """Return the local filesystem path of the completed download."""
-    files = st.get("files", [])
-    if files:
-        p = files[0].get("path", "")
-        if p: return p
-    bt = st.get("bittorrent", {})
+    """
+    Return the local filesystem path of the completed download.
+
+    For BitTorrent downloads that contain multiple files, aria2 stores them
+    inside a sub-directory named after the torrent.  files[0]["path"] would
+    only give the first file — we must return the *directory* instead.
+
+    Priority:
+      1. BT name → DOWNLOAD_DIR/<name>  (directory or single-file)
+      2. Single file → files[0]["path"]
+      3. Fallback → ""
+    """
+    bt   = st.get("bittorrent", {})
     info = bt.get("info", {})
     name = info.get("name", "")
     if name:
-        return os.path.join(DOWNLOAD_DIR, name)
+        # aria2 puts BT content in DOWNLOAD_DIR/<name>
+        candidate = os.path.join(DOWNLOAD_DIR, name)
+        if os.path.exists(candidate):
+            return candidate
+        # If the path doesn't exist yet (race), fall through to files list
+
+    files = st.get("files", [])
+    if len(files) == 1:
+        p = files[0].get("path", "")
+        if p:
+            return p
+    elif len(files) > 1:
+        # Multiple files → find common parent directory
+        paths = [f.get("path", "") for f in files if f.get("path")]
+        if paths:
+            common = os.path.commonpath(paths)
+            # common is DOWNLOAD_DIR or DOWNLOAD_DIR/<name>
+            if common != DOWNLOAD_DIR:
+                return common
+            # fallback: return first file's parent
+            return os.path.dirname(paths[0])
     return ""
+
 
 async def aria2_remove_gid(gid: str):
     """Force-remove a GID from aria2, ignoring errors."""
@@ -328,21 +350,28 @@ def dashboard_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Refresh", callback_data=f"dash:{user_id}")
     ]])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FloodWait-safe edit queue
-# ONE serialised coroutine per user — edits are never concurrent
-# MIN_EDIT_GAP enforced after every successful edit
 # ─────────────────────────────────────────────────────────────────────────────
 async def edit_worker(user_id: int):
-    q = user_edit_queues[user_id]
+    q = user_edit_queues.get(user_id)
+    if q is None:
+        return
     while True:
         item = await q.get()
         if item is None:                 # shutdown signal
-            q.task_done(); break
+            q.task_done()
+            # ── FIX 5: remove dead queue so _enqueue_edit creates a fresh one ──
+            user_edit_queues.pop(user_id, None)
+            break
         text, kb = item
         dash = user_dashboards.get(user_id)
         if not dash:
-            q.task_done(); break
+            q.task_done()
+            user_edit_queues.pop(user_id, None)
+            break
         if text == dash.get("last_text", ""):
             q.task_done(); await asyncio.sleep(1); continue
         try:
@@ -359,7 +388,7 @@ async def edit_worker(user_id: int):
         except Exception as e:
             print(f"Edit worker error user {user_id}: {e}")
         q.task_done()
-        await asyncio.sleep(MIN_EDIT_GAP)   # hard rate-limit gate
+        await asyncio.sleep(MIN_EDIT_GAP)
 
 async def _enqueue_edit(user_id: int):
     dash = user_dashboards.get(user_id)
@@ -368,11 +397,11 @@ async def _enqueue_edit(user_id: int):
     if time.time() - dash.get("last_edit_at", 0) < MIN_EDIT_GAP: return
     text = build_dashboard_text(user_id, dash.get("user_label", f"#ID{user_id}"))
     if text == dash.get("last_text", ""): return
+    # ── FIX 6: always ensure a live worker exists before enqueuing ────────────
     if user_id not in user_edit_queues:
         user_edit_queues[user_id] = asyncio.Queue(maxsize=2)
         asyncio.create_task(edit_worker(user_id))
     q = user_edit_queues[user_id]
-    # Drain stale pending updates — only latest state matters
     while not q.empty():
         try: q.get_nowait(); q.task_done()
         except Exception: break
@@ -385,7 +414,7 @@ async def push_dashboard_update(user_id: int):
     await _enqueue_edit(user_id)
 
 async def dashboard_loop(user_id: int):
-    """Auto-refresh ticker. Fires every DASHBOARD_REFRESH_INTERVAL seconds."""
+    """Auto-refresh ticker."""
     while True:
         await asyncio.sleep(DASHBOARD_REFRESH_INTERVAL)
         dash = user_dashboards.get(user_id)
@@ -393,10 +422,10 @@ async def dashboard_loop(user_id: int):
         user_tasks = [t for t in active_downloads.values() if t.user_id == user_id]
         if not user_tasks:
             # Shut down edit worker
-            q = user_edit_queues.pop(user_id, None)
+            q = user_edit_queues.get(user_id)
             if q:
                 try: q.put_nowait(None)
-                except Exception: pass
+                except asyncio.QueueFull: pass
             try:
                 await dash["msg"].edit_text("✅ **All tasks completed!**", reply_markup=None)
             except Exception: pass
@@ -451,11 +480,37 @@ async def dashboard_refresh_callback(client, cq: CallbackQuery):
     except Exception as e:
         await cq.answer(f"❌ {e}", show_alert=True)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # aioaria2 EVENT HANDLERS
-# These replace the old polling loop entirely.
-# aria2 pushes notifications the instant something happens — zero delay.
+#
+# FIX 2 (event data format): aioaria2 >= v1.3.0 passes a plain dict as the
+# second argument — NOT an asyncio.Future (that was v1.2.x).
+# The dict has the shape {"gid": "<gid_string>"}.
+# We handle both for forward/backward compat.
 # ─────────────────────────────────────────────────────────────────────────────
+def _extract_gid(gid_param) -> str:
+    """Safely extract GID string from aioaria2 event callback parameter.
+
+    aioaria2 < v1.3.0  → gid_param is asyncio.Future; call .result() → dict
+    aioaria2 >= v1.3.0 → gid_param is dict {"gid": "..."}
+    Either way, fall back to str() as last resort.
+    """
+    import asyncio as _asyncio
+    if _asyncio.isfuture(gid_param):
+        try:
+            data = gid_param.result()
+        except Exception:
+            return ""
+    else:
+        data = gid_param
+    if isinstance(data, dict):
+        return data.get("gid", "")
+    if isinstance(data, str):
+        return data
+    return str(data)
+
+
 def _find_task_by_gid(gid: str) -> DownloadTask | None:
     return active_downloads.get(gid)
 
@@ -464,13 +519,12 @@ def _register_aria2_callbacks():
 
     @aria2.onDownloadStart
     async def on_start(trigger, gid_param):
-        gid = gid_param if isinstance(gid_param, str) else gid_param.get("gid", "")
+        gid = _extract_gid(gid_param)
         print(f"▶️  aria2 started: {gid}")
 
     @aria2.onDownloadComplete
     async def on_complete(trigger, gid_param):
-        """Fires for direct HTTP/FTP downloads when 100% is reached."""
-        gid = gid_param if isinstance(gid_param, str) else gid_param.get("gid", "")
+        gid = _extract_gid(gid_param)
         print(f"✅ aria2 complete: {gid}")
         task = _find_task_by_gid(gid)
         if task and not task.done_event.is_set():
@@ -478,8 +532,7 @@ def _register_aria2_callbacks():
 
     @aria2.onBtDownloadComplete
     async def on_bt_complete(trigger, gid_param):
-        """Fires for BitTorrent downloads (including magnet-resolved) when done."""
-        gid = gid_param if isinstance(gid_param, str) else gid_param.get("gid", "")
+        gid = _extract_gid(gid_param)
         print(f"✅ aria2 BT complete: {gid}")
         task = _find_task_by_gid(gid)
         if task and not task.done_event.is_set():
@@ -487,7 +540,7 @@ def _register_aria2_callbacks():
 
     @aria2.onDownloadError
     async def on_error(trigger, gid_param):
-        gid = gid_param if isinstance(gid_param, str) else gid_param.get("gid", "")
+        gid = _extract_gid(gid_param)
         print(f"❌ aria2 error: {gid}")
         task = _find_task_by_gid(gid)
         if task:
@@ -500,20 +553,18 @@ def _register_aria2_callbacks():
 
     @aria2.onDownloadStop
     async def on_stop(trigger, gid_param):
-        gid = gid_param if isinstance(gid_param, str) else gid_param.get("gid", "")
+        gid = _extract_gid(gid_param)
         print(f"⏹  aria2 stopped: {gid}")
         task = _find_task_by_gid(gid)
         if task:
             task.error_msg = "Download stopped/removed"
             task.error_event.set()
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Stats poller — runs per task while in "dl" phase
-# Only reads status for UI updates. Completion is detected via events above.
-# Also handles magnet → real GID handoff (followedBy field).
+# Stats poller — UI updates only; completion detected via events
 # ─────────────────────────────────────────────────────────────────────────────
 async def poll_stats(task: DownloadTask):
-    """Update task.dl dict every 3s using aioaria2.tellStatus — no polling for completion."""
     await asyncio.sleep(2)
     while not task.cancelled and not task.done_event.is_set() and not task.error_event.is_set():
         try:
@@ -541,7 +592,6 @@ async def poll_stats(task: DownloadTask):
             eta       = ((total - completed) / speed) if speed > 0 else 0
             name      = parse_name(st)
 
-            # Seeder / connection info
             seeders     = _int(st.get("numSeeders", 0))
             connections = _int(st.get("connections", 0))
             if seeders > 0:
@@ -563,6 +613,7 @@ async def poll_stats(task: DownloadTask):
             print(f"Stats poll error gid={task.gid}: {e}")
 
         await asyncio.sleep(3)
+
 
 # ── Extract archive ───────────────────────────────────────────────────────────
 async def extract_archive(file_path: str, extract_to: str, task: DownloadTask = None) -> bool:
@@ -655,6 +706,7 @@ async def extract_archive(file_path: str, extract_to: str, task: DownloadTask = 
         print(f"Extraction error: {e}")
         return False
 
+
 # ── Upload to Telegram ────────────────────────────────────────────────────────
 async def upload_to_telegram(
     file_path: str, message: Message,
@@ -713,7 +765,7 @@ async def upload_to_telegram(
                 )
             return True
 
-        # ── Directory (multi-file extracted) ─────────────────────────────────
+        # ── Directory (multi-file) ────────────────────────────────────────────
         elif os.path.isdir(file_path):
             files = [
                 os.path.join(r, f)
@@ -728,12 +780,15 @@ async def upload_to_telegram(
             total_bytes    = sum(os.path.getsize(fp) for fp in files)
             uploaded_bytes = 0
             dir_start      = time.time()
+
             for idx, fp in enumerate(files, 1):
                 raw = os.path.basename(fp); cn = clean_filename(raw)
                 if raw != cn:
                     np = os.path.join(os.path.dirname(fp), cn)
                     os.rename(fp, np); fp = np
                 file_sz = os.path.getsize(fp)
+
+                # ── FIX 9: update dashboard BEFORE sending each file ─────────
                 if task:
                     elapsed = time.time() - dir_start
                     spd     = uploaded_bytes / elapsed if elapsed > 0 else 0
@@ -744,48 +799,82 @@ async def upload_to_telegram(
                         "file_index": idx, "total_files": n,
                     })
                     await push_dashboard_update(user_id)
+
                 cap = f"📄 {cn} [{idx}/{n}]"
                 if as_video and fp.lower().endswith(video_exts):
                     await message.reply_video(video=fp, caption=cap, disable_notification=True)
                 else:
                     await message.reply_document(document=fp, caption=cap, disable_notification=True)
+
                 uploaded_bytes += file_sz
+
+                # Push once more after file completes so progress shows accurately
+                if task:
+                    elapsed = time.time() - dir_start
+                    spd     = uploaded_bytes / elapsed if elapsed > 0 else 0
+                    eta     = (total_bytes - uploaded_bytes) / spd if spd > 0 else 0
+                    task.ul.update({
+                        "uploaded": uploaded_bytes, "total": total_bytes,
+                        "speed": spd, "elapsed": elapsed, "eta": eta,
+                    })
+                    await push_dashboard_update(user_id)
+
             return True
 
     except Exception as e:
         await message.reply_text(f"❌ Upload error: {str(e)}")
         return False
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Core task processor
-# BEFORE: used a while loop polling aria2 every 2s
-# NOW:    starts stats poller + waits on done_event / error_event (instant)
+#
+# FIX 3 (event wait): replaced asyncio.gather(ensure_future(...)) with
+# asyncio.wait(return_when=FIRST_COMPLETED) which properly cancels the
+# remaining waiter, preventing indefinite background task accumulation.
 # ─────────────────────────────────────────────────────────────────────────────
+async def _wait_for_aria2_event(task: DownloadTask, timeout: float = 5.0):
+    """
+    Wait until task.done_event OR task.error_event is set.
+    Uses asyncio.wait with FIRST_COMPLETED to avoid leaking background tasks.
+    Returns True if done, False if error, None if timeout/cancelled.
+    """
+    done_fut  = asyncio.ensure_future(task.done_event.wait())
+    error_fut = asyncio.ensure_future(task.error_event.wait())
+    try:
+        finished, pending = await asyncio.wait(
+            {done_fut, error_fut},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for f in pending:
+            f.cancel()
+        if task.done_event.is_set():
+            return True
+        if task.error_event.is_set():
+            return False
+        return None   # timeout — caller should loop
+    except Exception:
+        done_fut.cancel()
+        error_fut.cancel()
+        return None
+
+
 async def process_task_execution(message: Message, task: DownloadTask, extract: bool):
     gid = task.gid
     active_downloads[gid] = task
     try:
-        # Start non-blocking UI stats poller
         asyncio.create_task(poll_stats(task))
         await push_dashboard_update(task.user_id)
 
-        # Wait for aria2 to signal completion OR error (event-driven, no polling)
+        # Event-driven wait loop
         while not task.cancelled:
-            done, err = task.done_event, task.error_event
-            # Wait with a short timeout so we can re-check task.cancelled
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        asyncio.ensure_future(done.wait()),
-                        asyncio.ensure_future(err.wait()),
-                        return_exceptions=True,
-                    ),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                pass
-            if done.is_set() or err.is_set():
+            result = await _wait_for_aria2_event(task, timeout=5.0)
+            if result is True:   # done_event fired
                 break
+            if result is False:  # error_event fired
+                break
+            # None = timeout, loop again
 
         if task.cancelled:
             await aria2_remove_gid(task.gid)
@@ -801,15 +890,20 @@ async def process_task_execution(message: Message, task: DownloadTask, extract: 
             await push_dashboard_update(task.user_id)
             return
 
-        # Download finished — resolve file path from aria2
+        # Download finished — resolve file path
         st = await aria2_tell_status(task.gid)
         fp = parse_file_path(st)
+
+        # ── FIX 12: safer fallback using raw filename from aria2, not cleaned ─
         if not fp:
-            fp = os.path.join(DOWNLOAD_DIR, task.dl.get("filename", "unknown"))
+            files = st.get("files", [])
+            raw_name = files[0].get("path", "") if files else ""
+            fp = raw_name if raw_name else os.path.join(DOWNLOAD_DIR, task.dl.get("filename", "unknown"))
+
         task.file_path = fp
 
         # Extract phase (optional)
-        if extract and fp.endswith((".zip", ".7z", ".tar.gz", ".tgz", ".tar")):
+        if extract and os.path.isfile(fp) and fp.endswith((".zip", ".7z", ".tar.gz", ".tgz", ".tar")):
             ed = os.path.join(DOWNLOAD_DIR, f"extracted_{int(time.time())}")
             os.makedirs(ed, exist_ok=True)
             task.extract_dir = ed
@@ -820,7 +914,6 @@ async def process_task_execution(message: Message, task: DownloadTask, extract: 
         else:
             us, cap = fp, ""
 
-        # Upload phase
         await upload_to_telegram(us, message, caption=cap, task=task)
 
         cleanup_files(task)
@@ -833,22 +926,21 @@ async def process_task_execution(message: Message, task: DownloadTask, extract: 
         active_downloads.pop(task.gid, None)
         await push_dashboard_update(task.user_id)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # aioaria2 add helpers
-# aioaria2 addTorrent requires base64-encoded torrent data (not a file path)
 # ─────────────────────────────────────────────────────────────────────────────
 async def aria2_add_uri(urls: list, opts: dict) -> str:
-    """Add URI(s) to aria2. Returns GID string."""
     result = await aria2.addUri(urls, opts)
-    return result if isinstance(result, str) else result.get("gid", result)
+    return result if isinstance(result, str) else result.get("gid", str(result))
 
 
 async def aria2_add_torrent(torrent_path: str, opts: dict) -> str:
-    """Read a .torrent file, base64-encode it, add to aria2. Returns GID string."""
     with open(torrent_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
     result = await aria2.addTorrent(b64, [], opts)
-    return result if isinstance(result, str) else result.get("gid", result)
+    return result if isinstance(result, str) else result.get("gid", str(result))
+
 
 # ── Bot command handlers ──────────────────────────────────────────────────────
 @app.on_message(filters.command(["leech", "l", "ql", "qbleech"]))
@@ -882,7 +974,8 @@ async def universal_leech_command(client, message: Message):
 
     for link in links:
         try:
-            opts = BT_OPTIONS if link.startswith("magnet:") else {**BT_OPTIONS, **DIRECT_OPTIONS}
+            # ── FIX 3: magnets use BT_OPTIONS; HTTP links use DIRECT_OPTIONS only ──
+            opts = BT_OPTIONS if link.startswith("magnet:") else DIRECT_OPTIONS
             gid  = await aria2_add_uri([link], opts)
             task = DownloadTask(gid, user_id, extract)
             active_downloads[gid] = task
@@ -910,6 +1003,7 @@ async def handle_torrent_document(client, message: Message):
         await message.reply_text(f"❌ **Error processing torrent:** `{str(e)}`")
 
 
+# ── FIX 8: stop_command only cancels the task — cleanup is done by process_task_execution ──
 @app.on_message(filters.command(["stop"]) | filters.regex(r"^/stop_\w+"))
 async def stop_command(client, message: Message):
     try:
@@ -924,15 +1018,16 @@ async def stop_command(client, message: Message):
                 found_task = t; found_gid = gid; break
         if not found_task:
             await message.reply_text(f"❌ **Task `{gid_short}` not found!**"); return
+
+        # Only signal cancellation — let process_task_execution handle cleanup
+        # to avoid race conditions during active extract/upload phases.
         found_task.cancelled = True
         await aria2_remove_gid(found_task.gid)
-        cleanup_files(found_task)
-        active_downloads.pop(found_gid, None)
-        active_downloads.pop(found_task.gid, None)
-        await message.reply_text(f"✅ **Task `{gid_short}` cancelled & files cleaned!**")
+        await message.reply_text(f"✅ **Task `{gid_short}` cancellation requested. Files will be cleaned up.**")
         await push_dashboard_update(found_task.user_id)
     except Exception as e:
         await message.reply_text(f"❌ **Error:** `{str(e)}`")
+
 
 @app.on_message(filters.command(["start"]))
 async def start_command(client, message: Message):
@@ -1026,7 +1121,13 @@ async def start_web_server():
     print(f"🌐 Keep-alive server on port {PORT}")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+#
+# FIX 1: Aria2WebsocketClient.new() expects an http:// URL — it converts to
+# ws:// internally.  Passing ws:// directly breaks the connection on some
+# aiohttp versions.
+# ─────────────────────────────────────────────────────────────────────────────
 async def main():
     global aria2
 
@@ -1036,16 +1137,16 @@ async def main():
     print(f"⏱️  Min edit gap : {MIN_EDIT_GAP}s")
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-    # Connect to aria2 via WebSocket — persistent, bi-directional
-    ws_url = f"ws://{ARIA2_HOST.replace('http://', '').replace('https://', '')}:{ARIA2_PORT}/jsonrpc"
-    print(f"🔌 Connecting to aria2 WebSocket at {ws_url} ...")
+    # ── FIX 1: pass http:// URL — aioaria2 handles ws:// conversion ──────────
+    host_clean = ARIA2_HOST.rstrip("/").replace("http://", "").replace("https://", "")
+    http_url   = f"http://{host_clean}:{ARIA2_PORT}/jsonrpc"
+    print(f"🔌 Connecting to aria2 WebSocket at {http_url} ...")
     aria2 = await aioaria2.Aria2WebsocketClient.new(
-        url=ws_url,
+        url=http_url,
         token=ARIA2_SECRET,
     )
     print("✅ aria2 WebSocket connected")
 
-    # Register all event callbacks now that client exists
     _register_aria2_callbacks()
 
     await app.start()
